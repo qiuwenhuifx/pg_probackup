@@ -18,6 +18,21 @@
 
 #include <sys/stat.h>
 
+static const char *statusName[] =
+{
+	"UNKNOWN",
+	"OK",
+	"ERROR",
+	"RUNNING",
+	"MERGING",
+	"MERGED",
+	"DELETING",
+	"DELETED",
+	"DONE",
+	"ORPHAN",
+	"CORRUPT"
+};
+
 const char *
 base36enc(long unsigned int value)
 {
@@ -336,6 +351,39 @@ get_pgcontrol_checksum(const char *pgdata_path)
 	return ControlFile.crc;
 }
 
+void
+get_redo(const char *pgdata_path, RedoParams *redo)
+{
+	ControlFileData ControlFile;
+	char	   *buffer;
+	size_t		size;
+
+	/* First fetch file... */
+	buffer = slurpFile(pgdata_path, XLOG_CONTROL_FILE, &size, false, FIO_DB_HOST);
+
+	digestControlFile(&ControlFile, buffer, size);
+	pg_free(buffer);
+
+	redo->lsn = ControlFile.checkPointCopy.redo;
+	redo->tli = ControlFile.checkPointCopy.ThisTimeLineID;
+
+	if (ControlFile.minRecoveryPoint > 0 &&
+		ControlFile.minRecoveryPoint < redo->lsn)
+	{
+		redo->lsn = ControlFile.minRecoveryPoint;
+		redo->tli = ControlFile.minRecoveryPointTLI;
+	}
+
+	if (ControlFile.backupStartPoint > 0 &&
+		ControlFile.backupStartPoint < redo->lsn)
+	{
+		redo->lsn = ControlFile.backupStartPoint;
+		redo->tli = ControlFile.checkPointCopy.ThisTimeLineID;
+	}
+
+	redo->checksum_version = ControlFile.data_checksum_version;
+}
+
 /*
  * Rewrite minRecoveryPoint of pg_control in backup directory. minRecoveryPoint
  * 'as-is' is not to be trusted.
@@ -462,22 +510,123 @@ parse_program_version(const char *program_version)
 const char *
 status2str(BackupStatus status)
 {
-	static const char *statusName[] =
-	{
-		"UNKNOWN",
-		"OK",
-		"ERROR",
-		"RUNNING",
-		"MERGING",
-		"MERGED",
-		"DELETING",
-		"DELETED",
-		"DONE",
-		"ORPHAN",
-		"CORRUPT"
-	};
 	if (status < BACKUP_STATUS_INVALID || BACKUP_STATUS_CORRUPT < status)
 		return "UNKNOWN";
 
 	return statusName[status];
+}
+
+BackupStatus
+str2status(const char *status)
+{
+	BackupStatus i;
+
+	for (i = BACKUP_STATUS_INVALID; i <= BACKUP_STATUS_CORRUPT; i++)
+	{
+		if (pg_strcasecmp(status, statusName[i]) == 0) return i;
+	}
+
+	return BACKUP_STATUS_INVALID;
+}
+
+bool
+datapagemap_is_set(datapagemap_t *map, BlockNumber blkno)
+{
+	int			offset;
+	int			bitno;
+
+	offset = blkno / 8;
+	bitno = blkno % 8;
+
+	/* enlarge or create bitmap if needed */
+	if (map->bitmapsize <= offset)
+	{
+		int			oldsize = map->bitmapsize;
+		int			newsize;
+
+		/*
+		 * The minimum to hold the new bit is offset + 1. But add some
+		 * headroom, so that we don't need to repeatedly enlarge the bitmap in
+		 * the common case that blocks are modified in order, from beginning
+		 * of a relation to the end.
+		 */
+		newsize = offset + 1;
+		newsize += 10;
+
+		map->bitmap = pg_realloc(map->bitmap, newsize);
+
+		/* zero out the newly allocated region */
+		memset(&map->bitmap[oldsize], 0, newsize - oldsize);
+
+		map->bitmapsize = newsize;
+	}
+
+	//datapagemap_print(map);
+
+	/* check the bit */
+	return map->bitmap[offset] & (1 << bitno);
+}
+
+/*
+ * A debugging aid. Prints out the contents of the page map.
+ */
+void
+datapagemap_print_debug(datapagemap_t *map)
+{
+	datapagemap_iterator_t *iter;
+	BlockNumber blocknum;
+
+	iter = datapagemap_iterate(map);
+	while (datapagemap_next(iter, &blocknum))
+		elog(INFO, "  block %u", blocknum);
+
+	pg_free(iter);
+}
+
+/*
+ * Return pid of postmaster process running in given pgdata.
+ * Return 0 if there is none.
+ * Return 1 if postmaster.pid is mangled.
+ */
+pid_t
+check_postmaster(const char *pgdata)
+{
+	FILE  *fp;
+	pid_t  pid;
+	char   pid_file[MAXPGPATH];
+
+	snprintf(pid_file, MAXPGPATH, "%s/postmaster.pid", pgdata);
+
+	fp = fopen(pid_file, "r");
+	if (fp == NULL)
+	{
+		/* No pid file, acceptable*/
+		if (errno == ENOENT)
+			return 0;
+		else
+			elog(ERROR, "Cannot open file \"%s\": %s",
+				pid_file, strerror(errno));
+	}
+
+	if (fscanf(fp, "%i", &pid) != 1)
+	{
+		/* something is wrong with the file content */
+		pid = 1;
+	}
+
+	if (pid > 1)
+	{
+		if (kill(pid, 0) != 0)
+		{
+			/* process no longer exists */
+			if (errno == ESRCH)
+				pid = 0;
+			else
+				elog(ERROR, "Failed to send signal 0 to a process %d: %s",
+						pid, strerror(errno));
+		}
+	}
+
+	fclose(fp);
+	return pid;
 }

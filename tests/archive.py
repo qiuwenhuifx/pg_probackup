@@ -398,7 +398,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             log_content)
 
         self.assertIn(
-            'pg_probackup push file',
+            'pg_probackup archive-push WAL file',
             log_content)
 
         self.assertIn(
@@ -482,7 +482,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         self.assertIn(
             'DETAIL:  The failed archive command was:', log_content)
         self.assertIn(
-            'pg_probackup push file', log_content)
+            'pg_probackup archive-push WAL file', log_content)
         self.assertNotIn(
             'WAL file already exists in archive with '
             'different checksum, overwriting', log_content)
@@ -593,7 +593,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
-    def test_archive_push_partial_file_exists_not_stale(self):
+    def test_archive_push_part_file_exists_not_stale(self):
         """Archive-push if .part file exists and it is not stale"""
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -765,10 +765,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         before = master.safe_psql("postgres", "SELECT * FROM t_heap")
 
-        master.safe_psql(
-            "postgres",
-            "CHECKPOINT")
-
         self.wait_until_replica_catch_with_master(master, replica)
 
         backup_id = self.backup_node(
@@ -864,10 +860,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             "md5(repeat(i::text,10))::tsvector as tsvector "
             "from generate_series(0, 60000) i")
 
-        master.psql(
-            "postgres",
-            "CHECKPOINT")
-
         backup_id = self.backup_node(
             backup_dir, 'replica', replica,
             options=[
@@ -896,8 +888,8 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         """
             make node 'master 'with archiving,
             take archive backup and turn it into replica,
-            set replica with archiving, make archive backup from replica,
-            make archive backup from master
+            set replica with archiving,
+            make sure that archiving on both node is working.
         """
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -941,11 +933,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         pgdata_replica = self.pgdata_content(replica.data_dir)
         self.compare_pgdata(pgdata_master, pgdata_replica)
 
-        self.set_replica(master, replica, synchronous=True)
+        self.set_replica(master, replica, synchronous=False)
         # ADD INSTANCE REPLICA
         # self.add_instance(backup_dir, 'replica', replica)
         # SET ARCHIVING FOR REPLICA
-        # self.set_archiving(backup_dir, 'replica', replica, replica=True)
+        self.set_archiving(backup_dir, 'master', replica, replica=True)
         replica.slow_start(replica=True)
 
         # CHECK LOGICAL CORRECTNESS on REPLICA
@@ -959,13 +951,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             "from generate_series(0,10000) i")
 
         # TAKE FULL ARCHIVE BACKUP FROM REPLICA
-        backup_id = self.backup_node(
-            backup_dir, 'master', replica,
-            options=[
-                '--archive-timeout=30',
-                '--master-host=localhost',
-                '--master-db=postgres',
-                '--master-port={0}'.format(master.port)])
+        backup_id = self.backup_node(backup_dir, 'master', replica)
 
         self.validate_pb(backup_dir, 'master')
         self.assertEqual(
@@ -977,8 +963,20 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(
             'OK', self.show_pb(backup_dir, 'master', backup_id)['status'])
 
+        master.pgbench_init(scale=10)
+
+        sleep(10)
+
+        replica.promote()
+
+        master.pgbench_init(scale=10)
+        replica.pgbench_init(scale=10)
+
+        self.backup_node(backup_dir, 'master', master)
+        self.backup_node(backup_dir, 'master', replica)
+
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, nodes=[master, replica])
 
     # @unittest.expectedFailure
     # @unittest.skip("skip")
@@ -1151,6 +1149,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                 'checkpoint_timeout': '30s',
                 'autovacuum': 'off'})
 
+        if self.get_version(master) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
+
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'master', master)
         self.set_archiving(backup_dir, 'master', master)
@@ -1189,7 +1192,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             os.path.join(backup_dir, 'wal', 'master'),
             os.path.join(backup_dir, 'wal', 'replica'))
 
-        # Check data correctness on replica
         replica.slow_start(replica=True)
 
         # FULL backup replica
@@ -1206,11 +1208,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         # create timeline t2
         replica.promote()
-
-        # do checkpoint to increment timeline ID in pg_control
-        replica.safe_psql(
-            'postgres',
-            'CHECKPOINT')
 
         # FULL backup replica
         A1 = self.backup_node(
@@ -1460,6 +1457,10 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         """
         double segment - compressed and not
         """
+        if not self.archive_compress:
+            return self.fail(
+                'You need to enable ARCHIVE_COMPRESSION for this test to run')
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -1512,6 +1513,10 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         """
         double segment - compressed and not
         """
+        if not self.archive_compress:
+            return self.fail(
+                'You need to enable ARCHIVE_COMPRESSION for this test to run')
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -1767,7 +1772,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         # Clean after yourself
         self.del_test_dir(module_name, fname)
 
-    # @unittest.skip("skip")
+    @unittest.skip("skip")
     # @unittest.expectedFailure
     def test_archiving_and_slots(self):
         """
@@ -1905,7 +1910,559 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         # Clean after yourself
         self.del_test_dir(module_name, fname)
 
+    # @unittest.expectedFailure
+    # @unittest.skip("skip")
+    def test_archive_pg_receivexlog_partial_handling(self):
+        """check that archive-get delivers .partial and .gz.partial files"""
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'archive_timeout': '10s'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+
+        node.slow_start()
+
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
+
+        replica = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'replica'))
+        replica.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', replica, replica.data_dir, options=['-R'])
+        self.set_auto_conf(replica, {'port': replica.port})
+        self.set_replica(node, replica)
+
+        self.add_instance(backup_dir, 'replica', replica)
+        # self.set_archiving(backup_dir, 'replica', replica, replica=True)
+
+        replica.slow_start(replica=True)
+
+        if self.get_version(replica) < 100000:
+            pg_receivexlog_path = self.get_bin_path('pg_receivexlog')
+        else:
+            pg_receivexlog_path = self.get_bin_path('pg_receivewal')
+
+        cmdline = [
+            pg_receivexlog_path, '-p', str(replica.port), '--synchronous',
+            '-D', os.path.join(backup_dir, 'wal', 'replica')]
+
+        if self.archive_compress and node.major_version >= 10:
+            cmdline += ['-Z', '1']
+
+        pg_receivexlog = self.run_binary(cmdline, asynchronous=True)
+
+        if pg_receivexlog.returncode:
+            self.assertFalse(
+                True,
+                'Failed to start pg_receivexlog: {0}'.format(
+                    pg_receivexlog.communicate()[1]))
+
+        # FULL
+        self.backup_node(backup_dir, 'replica', replica, options=['--stream'])
+
+        node.safe_psql(
+            "postgres",
+            "create table t_heap as select i as id, md5(i::text) as text, "
+            "md5(repeat(i::text,10))::tsvector as tsvector "
+            "from generate_series(0,1000000) i")
+
+        # PAGE
+        self.backup_node(
+            backup_dir, 'replica', replica, backup_type='delta', options=['--stream'])
+
+        node.safe_psql(
+            "postgres",
+            "insert into t_heap select i as id, md5(i::text) as text, "
+            "md5(repeat(i::text,10))::tsvector as tsvector "
+            "from generate_series(1000000,2000000) i")
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        self.restore_node(
+            backup_dir, 'replica', node_restored,
+            node_restored.data_dir, options=['--recovery-target=latest', '--recovery-target-action=promote'])
+        self.set_auto_conf(node_restored, {'port': node_restored.port})
+        self.set_auto_conf(node_restored, {'hot_standby': 'off'})
+
+        # it will set node_restored as warm standby.
+#        with open(os.path.join(node_restored.data_dir, "standby.signal"), 'w') as f:
+#            f.flush()
+#            f.close()
+
+        node_restored.slow_start()
+
+        result = node.safe_psql(
+            "postgres",
+            "select sum(id) from t_heap")
+
+        result_new = node_restored.safe_psql(
+            "postgres",
+            "select sum(id) from t_heap")
+
+        self.assertEqual(result, result_new)
+
+        # Clean after yourself
+        pg_receivexlog.kill()
+        self.del_test_dir(
+            module_name, fname, [node, replica, node_restored])
+
+    @unittest.skip("skip")
+    def test_multi_timeline_recovery_prefetching(self):
+        """"""
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+
+        node.slow_start()
+
+        self.backup_node(backup_dir, 'node', node)
+
+        node.pgbench_init(scale=50)
+
+        target_xid = node.safe_psql(
+            'postgres',
+            'select txid_current()').rstrip()
+
+        node.pgbench_init(scale=20)
+
+        node.stop()
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+                '--recovery-target-xid={0}'.format(target_xid),
+                '--recovery-target-action=promote'])
+
+        node.slow_start()
+
+        node.pgbench_init(scale=20)
+
+        target_xid = node.safe_psql(
+            'postgres',
+            'select txid_current()').rstrip()
+
+        node.stop(['-m', 'immediate', '-D', node.data_dir])
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+#                '--recovery-target-xid={0}'.format(target_xid),
+                '--recovery-target-timeline=2',
+#                '--recovery-target-action=promote',
+                '--no-validate'])
+        node.slow_start()
+
+        node.pgbench_init(scale=20)
+        result = node.safe_psql(
+            'postgres',
+            'select * from pgbench_accounts')
+        node.stop()
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+#                '--recovery-target-xid=100500',
+                '--recovery-target-timeline=3',
+#                '--recovery-target-action=promote',
+                '--no-validate'])
+        os.remove(os.path.join(node.logs_dir, 'postgresql.log'))
+
+        restore_command = self.get_restore_command(backup_dir, 'node', node)
+        restore_command += ' -j 2 --batch-size=10 --log-level-console=VERBOSE'
+
+        if node.major_version >= 12:
+            node.append_conf(
+                'probackup_recovery.conf', "restore_command = '{0}'".format(restore_command))
+        else:
+            node.append_conf(
+                'recovery.conf', "restore_command = '{0}'".format(restore_command))
+
+        node.slow_start()
+
+        result_new = node.safe_psql(
+            'postgres',
+            'select * from pgbench_accounts')
+
+        self.assertEqual(result, result_new)
+
+        with open(os.path.join(node.logs_dir, 'postgresql.log'), 'r') as f:
+            postgres_log_content = f.read()
+
+        # check that requesting of non-existing segment do not
+        # throwns aways prefetch
+        self.assertIn(
+            'pg_probackup archive-get failed to '
+            'deliver WAL file: 000000030000000000000006',
+            postgres_log_content)
+
+        self.assertIn(
+            'pg_probackup archive-get failed to '
+            'deliver WAL file: 000000020000000000000006',
+            postgres_log_content)
+
+        self.assertIn(
+            'pg_probackup archive-get used prefetched '
+            'WAL segment 000000010000000000000006, prefetch state: 5/10',
+            postgres_log_content)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    def test_archive_get_batching_sanity(self):
+        """
+        Make sure that batching works.
+        .gz file is corrupted and uncompressed is not, check that both
+            corruption detected and uncompressed file is used.
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        if self.get_version(node) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+
+        node.slow_start()
+
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
+
+        node.pgbench_init(scale=50)
+
+        replica = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'replica'))
+        replica.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', replica, replica.data_dir)
+        self.set_replica(node, replica, log_shipping=True)
+
+        if node.major_version >= 12:
+            self.set_auto_conf(replica, {'restore_command': 'exit 1'})
+        else:
+            replica.append_conf('recovery.conf', "restore_command = 'exit 1'")
+
+        replica.slow_start(replica=True)
+
+        # at this point replica is consistent
+        restore_command = self.get_restore_command(backup_dir, 'node', replica)
+
+        restore_command += ' -j 2 --batch-size=10'
+
+        print(restore_command)
+
+        if node.major_version >= 12:
+            self.set_auto_conf(replica, {'restore_command': restore_command})
+        else:
+            replica.append_conf(
+                'recovery.conf', "restore_command = '{0}'".format(restore_command))
+
+        replica.restart()
+
+        sleep(5)
+
+        with open(os.path.join(replica.logs_dir, 'postgresql.log'), 'r') as f:
+            postgres_log_content = f.read()
+
+        self.assertIn(
+            'pg_probackup archive-get completed successfully, fetched: 10/10',
+            postgres_log_content)
+        self.assertIn('used prefetched WAL segment', postgres_log_content)
+        self.assertIn('prefetch state: 9/10', postgres_log_content)
+        self.assertIn('prefetch state: 8/10', postgres_log_content)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    def test_archive_get_prefetch_corruption(self):
+        """
+        Make sure that WAL corruption is detected.
+        And --prefetch-dir is honored.
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off', 'wal_keep_segments': '200'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+
+        node.slow_start()
+
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
+
+        node.pgbench_init(scale=50)
+
+        replica = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'replica'))
+        replica.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', replica, replica.data_dir)
+        self.set_replica(node, replica, log_shipping=True)
+
+        if node.major_version >= 12:
+            self.set_auto_conf(replica, {'restore_command': 'exit 1'})
+        else:
+            replica.append_conf('recovery.conf', "restore_command = 'exit 1'")
+
+        replica.slow_start(replica=True)
+
+        # at this point replica is consistent
+        restore_command = self.get_restore_command(backup_dir, 'node', replica)
+
+        restore_command += ' -j5 --batch-size=10 --log-level-console=VERBOSE'
+        #restore_command += ' --batch-size=2 --log-level-console=VERBOSE'
+
+        if node.major_version >= 12:
+            self.set_auto_conf(replica, {'restore_command': restore_command})
+        else:
+            replica.append_conf(
+                'recovery.conf', "restore_command = '{0}'".format(restore_command))
+
+        replica.restart()
+
+        sleep(5)
+
+        with open(os.path.join(replica.logs_dir, 'postgresql.log'), 'r') as f:
+            postgres_log_content = f.read()
+
+        self.assertIn(
+            'pg_probackup archive-get completed successfully, fetched: 10/10',
+            postgres_log_content)
+        self.assertIn('used prefetched WAL segment', postgres_log_content)
+        self.assertIn('prefetch state: 9/10', postgres_log_content)
+        self.assertIn('prefetch state: 8/10', postgres_log_content)
+
+        replica.stop()
+
+        # generate WAL, copy it into prefetch directory, then corrupt
+        # some segment
+        node.pgbench_init(scale=20)
+        sleep(20)
+
+        # now copy WAL files into prefetch directory and corrupt some of them
+        archive_dir = os.path.join(backup_dir, 'wal', 'node')
+        files = os.listdir(archive_dir)
+        files.sort()
+
+        for filename in [files[-4], files[-3], files[-2], files[-1]]:
+            src_file = os.path.join(archive_dir, filename)
+    
+            if node.major_version >= 10:
+                wal_dir = 'pg_wal'
+            else:
+                wal_dir = 'pg_xlog'
+    
+            if filename.endswith('.gz'):
+                dst_file = os.path.join(replica.data_dir, wal_dir, 'pbk_prefetch', filename[:-3])
+                with gzip.open(src_file, 'rb') as f_in, open(dst_file, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            else:
+                dst_file = os.path.join(replica.data_dir, wal_dir, 'pbk_prefetch', filename)
+                shutil.copyfile(src_file, dst_file)
+
+            print(dst_file)
+
+        # corrupt file
+        if files[-2].endswith('.gz'):
+            filename = files[-2][:-3]
+        else:
+            filename = files[-2]
+
+        prefetched_file = os.path.join(replica.data_dir, wal_dir, 'pbk_prefetch', filename)
+
+        with open(prefetched_file, "rb+", 0) as f:
+            f.seek(8192*2)
+            f.write(b"SURIKEN")
+            f.flush()
+            f.close
+
+        # enable restore_command
+        restore_command = self.get_restore_command(backup_dir, 'node', replica)
+        restore_command += ' --batch-size=2 --log-level-console=VERBOSE'
+
+        if node.major_version >= 12:
+            self.set_auto_conf(replica, {'restore_command': restore_command})
+        else:
+            replica.append_conf(
+                'recovery.conf', "restore_command = '{0}'".format(restore_command))
+
+        os.remove(os.path.join(replica.logs_dir, 'postgresql.log'))
+        replica.slow_start(replica=True)
+
+        sleep(60)
+
+        with open(os.path.join(replica.logs_dir, 'postgresql.log'), 'r') as f:
+            postgres_log_content = f.read()
+
+        self.assertIn(
+            'Prefetched WAL segment {0} is invalid, cannot use it'.format(filename),
+            postgres_log_content)
+
+        self.assertIn(
+            'LOG:  restored log file "{0}" from archive'.format(filename),
+            postgres_log_content)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.skip("skip")
+    def test_archive_show_partial_files_handling(self):
+        """
+        check that files with '.part', '.part.gz', '.partial' and '.partial.gz'
+        siffixes are handled correctly
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node, compress=False)
+
+        node.slow_start()
+
+        self.backup_node(backup_dir, 'node', node)
+
+        wals_dir = os.path.join(backup_dir, 'wal', 'node')
+
+        # .part file
+        node.safe_psql(
+            "postgres",
+            "create table t1()")
+
+        if self.get_version(node) < 100000:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_xlogfile_name_offset(pg_current_xlog_location())").rstrip()
+        else:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_walfile_name_offset(pg_current_wal_flush_lsn())").rstrip()
+
+        self.switch_wal_segment(node)
+
+        os.rename(
+            os.path.join(wals_dir, filename),
+            os.path.join(wals_dir, '{0}.part'.format(filename)))
+
+        # .gz.part file
+        node.safe_psql(
+            "postgres",
+            "create table t2()")
+
+        if self.get_version(node) < 100000:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_xlogfile_name_offset(pg_current_xlog_location())").rstrip()
+        else:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_walfile_name_offset(pg_current_wal_flush_lsn())").rstrip()
+
+        self.switch_wal_segment(node)
+
+        os.rename(
+            os.path.join(wals_dir, filename),
+            os.path.join(wals_dir, '{0}.gz.part'.format(filename)))
+
+        # .partial file
+        node.safe_psql(
+            "postgres",
+            "create table t3()")
+
+        if self.get_version(node) < 100000:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_xlogfile_name_offset(pg_current_xlog_location())").rstrip()
+        else:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_walfile_name_offset(pg_current_wal_flush_lsn())").rstrip()
+
+        self.switch_wal_segment(node)
+
+        os.rename(
+            os.path.join(wals_dir, filename),
+            os.path.join(wals_dir, '{0}.partial'.format(filename)))
+
+        # .gz.partial file
+        node.safe_psql(
+            "postgres",
+            "create table t4()")
+
+        if self.get_version(node) < 100000:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_xlogfile_name_offset(pg_current_xlog_location())").rstrip()
+        else:
+            filename = node.safe_psql(
+                "postgres",
+                "SELECT file_name "
+                "FROM pg_walfile_name_offset(pg_current_wal_flush_lsn())").rstrip()
+
+        self.switch_wal_segment(node)
+
+        os.rename(
+            os.path.join(wals_dir, filename),
+            os.path.join(wals_dir, '{0}.gz.partial'.format(filename)))
+
+        self.show_archive(backup_dir, 'node', options=['--log-level-file=VERBOSE'])
+
+        with open(os.path.join(backup_dir, 'log', 'pg_probackup.log'), 'r') as f:
+            log_content = f.read()
+
+        self.assertNotIn(
+            'WARNING',
+            log_content)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
 # TODO test with multiple not archived segments.
+# TODO corrupted file in archive.
 
 # important - switchpoint may be NullOffset LSN and not actually existing in archive to boot.
 # so write WAL validation code accordingly

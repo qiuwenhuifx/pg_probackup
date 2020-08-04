@@ -147,10 +147,9 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                 "without valid full backup.\n Output: {0} \n CMD: {1}".format(
                     repr(self.output), self.cmd))
         except ProbackupException as e:
-            self.assertIn(
-                "ERROR: Valid backup on current timeline 1 is not found. "
-                "Create new FULL backup before an incremental one.",
-                e.message,
+            self.assertTrue(
+                "WARNING: Valid backup on current timeline 1 is not found" in e.message and
+                "ERROR: Create new full backup before an incremental one" in e.message,
                 "\n Unexpected Error Message: {0}\n CMD: {1}".format(
                     repr(e.message), self.cmd))
 
@@ -165,15 +164,18 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                 "without valid full backup.\n Output: {0} \n CMD: {1}".format(
                     repr(self.output), self.cmd))
         except ProbackupException as e:
-            self.assertIn(
-                "ERROR: Valid backup on current timeline 1 is not found. "
-                "Create new FULL backup before an incremental one.",
-                e.message,
+            self.assertTrue(
+                "WARNING: Valid backup on current timeline 1 is not found" in e.message and
+                "ERROR: Create new full backup before an incremental one" in e.message,
                 "\n Unexpected Error Message: {0}\n CMD: {1}".format(
                     repr(e.message), self.cmd))
 
         self.assertEqual(
             self.show_pb(backup_dir, 'node')[0]['status'],
+            "ERROR")
+
+        self.assertEqual(
+            self.show_pb(backup_dir, 'node')[1]['status'],
             "ERROR")
 
         # Clean after yourself
@@ -315,16 +317,14 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
-    def test_page_corruption_heal_via_ptrack_1(self):
+    def test_page_detect_corruption(self):
         """make node, corrupt some page, check that backup failed"""
-        if not self.ptrack:
-            return unittest.skip('Skipped because ptrack support is disabled')
 
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            ptrack_enable=True,
+            ptrack_enable=self.ptrack,
             initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -332,11 +332,6 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
         node.slow_start()
-
-        if node.major_version >= 12:
-            node.safe_psql(
-                "postgres",
-                "CREATE EXTENSION ptrack WITH SCHEMA pg_catalog")
 
         self.backup_node(
             backup_dir, 'node', node,
@@ -356,122 +351,36 @@ class BackupTest(ProbackupTest, unittest.TestCase):
             "postgres",
             "select pg_relation_filepath('t_heap')").rstrip()
 
-        with open(os.path.join(node.data_dir, heap_path), "rb+", 0) as f:
+        path = os.path.join(node.data_dir, heap_path)
+        with open(path, "rb+", 0) as f:
                 f.seek(9000)
                 f.write(b"bla")
                 f.flush()
                 f.close
-
-        self.backup_node(
-            backup_dir, 'node', node, backup_type="full",
-            options=["-j", "4", "--stream", "--log-level-file=VERBOSE"])
-
-        # open log file and check
-        with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
-            log_content = f.read()
-            self.assertIn('block 1, try to fetch via shared buffer', log_content)
-            self.assertIn('SELECT pg_catalog.pg_ptrack_get_block', log_content)
-            f.close
-
-        self.assertTrue(
-            self.show_pb(backup_dir, 'node')[1]['status'] == 'OK',
-            "Backup Status should be OK")
-
-        # Clean after yourself
-        self.del_test_dir(module_name, fname)
-
-    # @unittest.skip("skip")
-    def test_page_corruption_heal_via_ptrack_2(self):
-        """make node, corrupt some page, check that backup failed"""
-        if not self.ptrack:
-            return unittest.skip('Skipped because ptrack support is disabled')
-
-        fname = self.id().split('.')[3]
-        node = self.make_simple_node(
-            base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True,
-            ptrack_enable=True,
-            initdb_params=['--data-checksums'])
-
-        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
-
-        self.init_pb(backup_dir)
-        self.add_instance(backup_dir, 'node', node)
-        node.slow_start()
-
-        if node.major_version >= 12:
-            node.safe_psql(
-                "postgres",
-                "CREATE EXTENSION ptrack WITH SCHEMA pg_catalog")
-
-        self.backup_node(
-            backup_dir, 'node', node, backup_type="full",
-            options=["-j", "4", "--stream"])
-
-        node.safe_psql(
-            "postgres",
-            "create table t_heap as select 1 as id, md5(i::text) as text, "
-            "md5(repeat(i::text,10))::tsvector as tsvector "
-            "from generate_series(0,1000) i")
-        node.safe_psql(
-            "postgres",
-            "CHECKPOINT;")
-
-        heap_path = node.safe_psql(
-            "postgres",
-            "select pg_relation_filepath('t_heap')").rstrip()
-        node.stop()
-
-        with open(os.path.join(node.data_dir, heap_path), "rb+", 0) as f:
-                f.seek(9000)
-                f.write(b"bla")
-                f.flush()
-                f.close
-        node.slow_start()
 
         try:
             self.backup_node(
                 backup_dir, 'node', node, backup_type="full",
-                options=["-j", "4", "--stream", '--log-level-console=LOG'])
-            # we should die here because exception is what we expect to happen
+                options=["-j", "4", "--stream", "--log-level-file=VERBOSE"])
             self.assertEqual(
                 1, 0,
-                "Expecting Error because of page "
-                "corruption in PostgreSQL instance.\n"
-                " Output: {0} \n CMD: {1}".format(
+                "Expecting Error because data file is corrupted"
+                "\n Output: {0} \n CMD: {1}".format(
                     repr(self.output), self.cmd))
         except ProbackupException as e:
-            if self.remote:
-                self.assertTrue(
-                    "WARNING: File" in e.message and
-                    "try to fetch via shared buffer" in e.message and
-                    "WARNING:  page verification failed, "
-                    "calculated checksum" in e.message and
-                    "ERROR: query failed: "
-                    "ERROR:  invalid page in block" in e.message and
-                    "query was: SELECT pg_catalog.pg_ptrack_get_block" in e.message,
-                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
-                        repr(e.message), self.cmd))
-            else:
-                self.assertTrue(
-                    "LOG: File" in e.message and
-                    "blknum" in e.message and
-                    "have wrong checksum" in e.message and
-                    "try to fetch via shared buffer" in e.message and
-                    "WARNING:  page verification failed, "
-                    "calculated checksum" in e.message and
-                    "ERROR: query failed: "
-                    "ERROR:  invalid page in block" in e.message and
-                    "query was: SELECT pg_catalog.pg_ptrack_get_block" in e.message,
-                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
-                        repr(e.message), self.cmd))
+            self.assertTrue(
+                'ERROR: Corruption detected in file "{0}", '
+                'block 1: page verification failed, calculated checksum'.format(path),
+                e.message)
 
-        self.assertTrue(
-             self.show_pb(backup_dir, 'node')[1]['status'] == 'ERROR',
-             "Backup Status should be ERROR")
+        self.assertEqual(
+            self.show_pb(backup_dir, 'node')[1]['status'],
+            'ERROR',
+            "Backup Status should be ERROR")
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)
+
 
     # @unittest.skip("skip")
     def test_backup_detect_corruption(self):
@@ -494,6 +403,10 @@ class BackupTest(ProbackupTest, unittest.TestCase):
             node.safe_psql(
                 "postgres",
                 "create extension ptrack")
+
+        self.backup_node(
+            backup_dir, 'node', node,
+            backup_type="full", options=["-j", "4", "--stream"])
 
         node.safe_psql(
             "postgres",
@@ -528,10 +441,6 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                 f.close
 
         node.slow_start()
-
-        # self.backup_node(
-        #     backup_dir, 'node', node,
-        #     backup_type="full", options=["-j", "4", "--stream"])
 
         try:
             self.backup_node(
@@ -608,12 +517,11 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                     "\n Output: {0} \n CMD: {1}".format(
                         repr(self.output), self.cmd))
             except ProbackupException as e:
-                self.assertTrue(
-                    'WARNING:  page verification failed, '
-                    'calculated checksum' in e.message and
-                    'ERROR: query failed: ERROR:  '
-                    'invalid page in block 1 of relation' in e.message and
-                    'ERROR: Data files transferring failed' in e.message,
+                self.assertIn(
+                    'ERROR: Corruption detected in file "{0}", block 1: '
+                    'page verification failed, calculated checksum'.format(
+                        heap_fullpath),
+                    e.message,
                     '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
                         repr(e.message), self.cmd))
 
@@ -751,12 +659,10 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                     "\n Output: {0} \n CMD: {1}".format(
                         repr(self.output), self.cmd))
             except ProbackupException as e:
-                self.assertTrue(
-                    'WARNING:  page verification failed, '
-                    'calculated checksum' in e.message and
-                    'ERROR: query failed: ERROR:  '
-                    'invalid page in block 1 of relation' in e.message and
-                    'ERROR: Data files transferring failed' in e.message,
+                self.assertIn(
+                    'ERROR: Corruption detected in file "{0}", block 1: '
+                    'page header invalid, pd_lower'.format(heap_fullpath),
+                    e.message,
                     '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
                         repr(e.message), self.cmd))
 
@@ -894,12 +800,10 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                     "\n Output: {0} \n CMD: {1}".format(
                         repr(self.output), self.cmd))
             except ProbackupException as e:
-                self.assertTrue(
-                    'WARNING:  page verification failed, '
-                    'calculated checksum' in e.message and
-                    'ERROR: query failed: ERROR:  '
-                    'invalid page in block 1 of relation' in e.message and
-                    'ERROR: Data files transferring failed' in e.message,
+                self.assertIn(
+                    'ERROR: Corruption detected in file "{0}", block 1: '
+                    'page header invalid, pd_lower'.format(heap_fullpath),
+                    e.message,
                     '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
                         repr(e.message), self.cmd))
 
@@ -1161,7 +1065,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
             self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, nodes=[node])
 
     # @unittest.skip("skip")
     def test_tablespace_handling_1(self):
@@ -1274,6 +1178,155 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
+    def test_drop_rel_during_full_backup(self):
+        """"""
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        node.slow_start()
+
+        for i in range(1, 512):
+            node.safe_psql(
+                "postgres",
+                "create table t_heap_{0} as select i"
+                " as id from generate_series(0,100) i".format(i))
+
+        node.safe_psql(
+            "postgres",
+            "VACUUM")
+
+        node.pgbench_init(scale=10)
+
+        relative_path_1 = node.safe_psql(
+            "postgres",
+            "select pg_relation_filepath('t_heap_1')").rstrip()
+
+        relative_path_2 = node.safe_psql(
+            "postgres",
+            "select pg_relation_filepath('t_heap_1')").rstrip()
+
+        absolute_path_1 = os.path.join(node.data_dir, relative_path_1)
+        absolute_path_2 = os.path.join(node.data_dir, relative_path_2)
+
+        # FULL backup
+        gdb = self.backup_node(
+            backup_dir, 'node', node,
+            options=['--stream', '--log-level-file=LOG', '--log-level-console=LOG', '--progress'],
+            gdb=True)
+
+        gdb.set_breakpoint('backup_files')
+        gdb.run_until_break()
+
+        # REMOVE file
+        for i in range(1, 512):
+            node.safe_psql(
+                "postgres",
+                "drop table t_heap_{0}".format(i))
+
+        node.safe_psql(
+            "postgres",
+            "CHECKPOINT")
+
+        node.safe_psql(
+            "postgres",
+            "CHECKPOINT")
+
+        # File removed, we can proceed with backup
+        gdb.continue_execution_until_exit()
+
+        pgdata = self.pgdata_content(node.data_dir)
+
+        #with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
+        #    log_content = f.read()
+        #    self.assertTrue(
+        #        'LOG: File "{0}" is not found'.format(absolute_path) in log_content,
+        #        'File "{0}" should be deleted but it`s not'.format(absolute_path))
+
+        node.cleanup()
+        self.restore_node(backup_dir, 'node', node)
+
+        # Physical comparison
+        pgdata_restored = self.pgdata_content(node.data_dir)
+        self.compare_pgdata(pgdata, pgdata_restored)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    @unittest.skip("skip")
+    def test_drop_db_during_full_backup(self):
+        """"""
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        node.slow_start()
+
+        for i in range(1, 2):
+            node.safe_psql(
+                "postgres",
+                "create database t_heap_{0}".format(i))
+
+        node.safe_psql(
+            "postgres",
+            "VACUUM")
+
+        # FULL backup
+        gdb = self.backup_node(
+            backup_dir, 'node', node, gdb=True,
+            options=[
+                '--stream', '--log-level-file=LOG',
+                '--log-level-console=LOG', '--progress'])
+
+        gdb.set_breakpoint('backup_files')
+        gdb.run_until_break()
+
+        # REMOVE file
+        for i in range(1, 2):
+            node.safe_psql(
+                "postgres",
+                "drop database t_heap_{0}".format(i))
+
+        node.safe_psql(
+            "postgres",
+            "CHECKPOINT")
+
+        node.safe_psql(
+            "postgres",
+            "CHECKPOINT")
+
+        # File removed, we can proceed with backup
+        gdb.continue_execution_until_exit()
+
+        pgdata = self.pgdata_content(node.data_dir)
+
+        #with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
+        #    log_content = f.read()
+        #    self.assertTrue(
+        #        'LOG: File "{0}" is not found'.format(absolute_path) in log_content,
+        #        'File "{0}" should be deleted but it`s not'.format(absolute_path))
+
+        node.cleanup()
+        self.restore_node(backup_dir, 'node', node)
+
+        # Physical comparison
+        pgdata_restored = self.pgdata_content(node.data_dir)
+        self.compare_pgdata(pgdata, pgdata_restored)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.skip("skip")
     def test_drop_rel_during_backup_delta(self):
         """"""
         fname = self.id().split('.')[3]
@@ -1287,6 +1340,8 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.add_instance(backup_dir, 'node', node)
         self.set_archiving(backup_dir, 'node', node)
         node.slow_start()
+
+        node.pgbench_init(scale=10)
 
         node.safe_psql(
             "postgres",
@@ -1327,7 +1382,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
             log_content = f.read()
             self.assertTrue(
-                'LOG: File "{0}" is not found'.format(absolute_path) in log_content,
+                'LOG: File not found: "{0}"'.format(absolute_path) in log_content,
                 'File "{0}" should be deleted but it`s not'.format(absolute_path))
 
         node.cleanup()
@@ -1348,7 +1403,8 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'])
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1416,7 +1472,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            ptrack_enable=True,
+            ptrack_enable=self.ptrack,
             initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
@@ -1462,7 +1518,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
             log_content = f.read()
             self.assertTrue(
-                'LOG: File "{0}" is not found'.format(absolute_path) in log_content,
+                'LOG: File not found: "{0}"'.format(absolute_path) in log_content,
                 'File "{0}" should be deleted but it`s not'.format(absolute_path))
 
         node.cleanup()
@@ -1542,7 +1598,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
             options=['--stream', '--slot=slot_1', '--temp-slot'])
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     # @unittest.skip("skip")
     def test_backup_concurrent_drop_table(self):
@@ -1587,7 +1643,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(show_backup['status'], "OK")
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, nodes=[node])
 
     # @unittest.skip("skip")
     def test_pg_11_adjusted_wal_segment_size(self):
@@ -1871,7 +1927,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         os.chmod(full_path, 700)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     # @unittest.skip("skip")
     def test_basic_missing_dir_permissions(self):
@@ -1914,7 +1970,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         os.chmod(full_path, 700)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     # @unittest.skip("skip")
     def test_backup_with_least_privileges_role(self):
@@ -2067,9 +2123,8 @@ class BackupTest(ProbackupTest, unittest.TestCase):
                         "TO backup".format(fname))
             else:
                 fnames = [
-                    'pg_catalog.pg_ptrack_get_pagemapset(pg_lsn)',
-                    'pg_catalog.pg_ptrack_control_lsn()',
-                    'pg_catalog.pg_ptrack_get_block(oid, oid, oid, bigint)'
+                    'pg_catalog.ptrack_get_pagemapset(pg_lsn)',
+                    'pg_catalog.ptrack_init_lsn()'
                 ]
 
                 for fname in fnames:
@@ -2307,7 +2362,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         # Clean after yourself
         self.del_test_dir(module_name, fname)
 
-    # @unittest.skip("skip")
+    @unittest.skip("skip")
     def test_backup_with_less_privileges_role(self):
         """
         check permissions correctness from documentation:
@@ -2510,7 +2565,7 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         # Clean after yourself
         self.del_test_dir(module_name, fname)
 
-    # @unittest.skip("skip")
+    @unittest.skip("skip")
     def test_issue_132(self):
         """
         https://github.com/postgrespro/pg_probackup/issues/132
@@ -2544,6 +2599,8 @@ class BackupTest(ProbackupTest, unittest.TestCase):
 
         pgdata_restored = self.pgdata_content(node.data_dir)
         self.compare_pgdata(pgdata, pgdata_restored)
+
+        exit(1)
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)
@@ -2706,6 +2763,138 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         self.assertIn(
             'INFO: Restore of backup {0} completed.'.format(delta_id),
             output)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    def test_note_sanity(self):
+        """
+        test that adding note to backup works as expected
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        # FULL backup
+        backup_id = self.backup_node(
+            backup_dir, 'node', node,
+            options=['--stream', '--log-level-file=LOG', '--note=test_note'])
+
+        show_backups = self.show_pb(backup_dir, 'node')
+
+        print(self.show_pb(backup_dir, as_text=True, as_json=True))
+
+        self.assertEqual(show_backups[0]['note'], "test_note")
+
+        self.set_backup(backup_dir, 'node', backup_id, options=['--note=none'])
+
+        backup_meta = self.show_pb(backup_dir, 'node', backup_id)
+
+        self.assertNotIn(
+            'note',
+            backup_meta)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.skip("skip")
+    def test_parent_backup_made_by_newer_version(self):
+        """incremental backup with parent made by newer version"""
+        fname = self.id().split('.')[3]
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            initdb_params=['--data-checksums'])
+
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        backup_id = self.backup_node(backup_dir, 'node', node)
+
+        control_file = os.path.join(
+            backup_dir, "backups", "node", backup_id,
+            "backup.control")
+
+        version = self.probackup_version
+        fake_new_version = str(int(version.split('.')[0]) + 1) + '.0.0'
+
+        with open(control_file, 'r') as f:
+            data = f.read();
+
+        data = data.replace(version, fake_new_version)
+
+        with open(control_file, 'w') as f:
+            f.write(data);
+
+        try:
+            self.backup_node(backup_dir, 'node', node, backup_type="page")
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because incremental backup should not be possible "
+                "if parent made by newer version.\n Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except ProbackupException as e:
+            self.assertIn(
+                "pg_probackup do not guarantee to be forward compatible. "
+                "Please upgrade pg_probackup binary.",
+                e.message,
+                "\n Unexpected Error Message: {0}\n CMD: {1}".format(
+                    repr(e.message), self.cmd))
+
+        self.assertEqual(
+            self.show_pb(backup_dir, 'node')[1]['status'], "ERROR")
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    @unittest.skip("skip")
+    def test_issue_203(self):
+        """
+        https://github.com/postgrespro/pg_probackup/issues/203
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        node.slow_start()
+
+        with node.connect("postgres") as conn:
+            for i in range(1000000):
+                conn.execute(
+                    "CREATE TABLE t_{0} as select 1".format(i))
+                conn.commit()
+
+        full_id = self.backup_node(
+            backup_dir, 'node', node, options=['--stream', '-j2'])
+
+        pgdata = self.pgdata_content(node.data_dir)
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        self.restore_node(backup_dir, 'node',
+            node_restored, data_dir=node_restored.data_dir)
+
+        pgdata_restored = self.pgdata_content(node_restored.data_dir)
+        self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)

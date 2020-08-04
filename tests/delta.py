@@ -45,39 +45,32 @@ class DeltaTest(ProbackupTest, unittest.TestCase):
             "create table t_heap as select i as id, "
             "md5(i::text) as text, "
             "md5(repeat(i::text,10))::tsvector as tsvector "
-            "from generate_series(0,1024) i;"
-        )
+            "from generate_series(0,1024) i;")
 
         node.safe_psql(
             "postgres",
-            "vacuum t_heap"
-        )
+            "vacuum t_heap")
 
         self.backup_node(backup_dir, 'node', node, options=['--stream'])
 
         node.safe_psql(
             "postgres",
-            "delete from t_heap where ctid >= '(11,0)'"
-        )
+            "delete from t_heap where ctid >= '(11,0)'")
 
         node.safe_psql(
             "postgres",
-            "vacuum t_heap"
-        )
+            "vacuum t_heap")
 
         self.backup_node(
-            backup_dir, 'node', node, backup_type='delta'
-        )
+            backup_dir, 'node', node, backup_type='delta')
 
         self.backup_node(
-            backup_dir, 'node', node, backup_type='delta'
-        )
+            backup_dir, 'node', node, backup_type='delta')
 
         pgdata = self.pgdata_content(node.data_dir)
 
         self.restore_node(
-            backup_dir, 'node', node_restored
-        )
+            backup_dir, 'node', node_restored)
 
         # Physical comparison
         pgdata_restored = self.pgdata_content(node_restored.data_dir)
@@ -87,7 +80,7 @@ class DeltaTest(ProbackupTest, unittest.TestCase):
         node_restored.slow_start()
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node, node_restored])
 
     # @unittest.skip("skip")
     def test_delta_vacuum_truncate_1(self):
@@ -1046,163 +1039,6 @@ class DeltaTest(ProbackupTest, unittest.TestCase):
         # START RESTORED NODE
         self.set_auto_conf(node_restored, {'port': node_restored.port})
         node_restored.slow_start()
-
-        # Clean after yourself
-        self.del_test_dir(module_name, fname)
-
-    # @unittest.skip("skip")
-    def test_delta_corruption_heal_via_ptrack(self):
-        """make node, corrupt some page, check that backup failed"""
-        if not self.ptrack:
-            return unittest.skip('Skipped because ptrack support is disabled')
-
-        fname = self.id().split('.')[3]
-        node = self.make_simple_node(
-            base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True,
-            initdb_params=['--data-checksums'])
-
-        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
-
-        self.init_pb(backup_dir)
-        self.add_instance(backup_dir, 'node', node)
-        node.slow_start()
-
-        if node.major_version >= 12:
-            node.safe_psql(
-                "postgres",
-                "CREATE EXTENSION ptrack WITH SCHEMA pg_catalog")
-
-        self.backup_node(
-            backup_dir, 'node', node,
-            backup_type="full", options=["-j", "4", "--stream"])
-
-        node.safe_psql(
-            "postgres",
-            "create table t_heap as select 1 as id, md5(i::text) as text, "
-            "md5(repeat(i::text,10))::tsvector as tsvector "
-            "from generate_series(0,1000) i")
-        node.safe_psql(
-            "postgres",
-            "CHECKPOINT;")
-
-        heap_path = node.safe_psql(
-            "postgres",
-            "select pg_relation_filepath('t_heap')").rstrip()
-
-        with open(os.path.join(node.data_dir, heap_path), "rb+", 0) as f:
-                f.seek(9000)
-                f.write(b"bla")
-                f.flush()
-                f.close
-
-        self.backup_node(
-            backup_dir, 'node', node,
-            backup_type="delta",
-            options=["-j", "4", "--stream", '--log-level-file=verbose'])
-
-        # open log file and check
-        with open(os.path.join(backup_dir, 'log', 'pg_probackup.log')) as f:
-            log_content = f.read()
-            self.assertIn('block 1, try to fetch via shared buffer', log_content)
-            self.assertIn('SELECT pg_catalog.pg_ptrack_get_block', log_content)
-            f.close
-
-        self.assertTrue(
-            self.show_pb(backup_dir, 'node')[1]['status'] == 'OK',
-            "Backup Status should be OK")
-
-        # Clean after yourself
-        self.del_test_dir(module_name, fname)
-
-    # @unittest.skip("skip")
-    def test_page_corruption_heal_via_ptrack(self):
-        """make node, corrupt some page, check that backup failed"""
-        if not self.ptrack:
-            return unittest.skip('Skipped because ptrack support is disabled')
-
-        fname = self.id().split('.')[3]
-        node = self.make_simple_node(
-            base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True,
-            initdb_params=['--data-checksums'])
-
-        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
-
-        self.init_pb(backup_dir)
-        self.add_instance(backup_dir, 'node', node)
-        node.slow_start()
-
-        if node.major_version >= 12:
-            node.safe_psql(
-                "postgres",
-                "CREATE EXTENSION ptrack WITH SCHEMA pg_catalog")
-
-        self.backup_node(
-            backup_dir, 'node', node, backup_type="full",
-            options=["-j", "4", "--stream"])
-
-        node.safe_psql(
-            "postgres",
-            "create table t_heap as select 1 as id, md5(i::text) as text, "
-            "md5(repeat(i::text,10))::tsvector as tsvector "
-            "from generate_series(0,1000) i")
-        node.safe_psql(
-            "postgres",
-            "CHECKPOINT;")
-
-        heap_path = node.safe_psql(
-            "postgres",
-            "select pg_relation_filepath('t_heap')").rstrip()
-        node.stop()
-
-        with open(os.path.join(node.data_dir, heap_path), "rb+", 0) as f:
-                f.seek(9000)
-                f.write(b"bla")
-                f.flush()
-                f.close
-        node.slow_start()
-
-        try:
-            self.backup_node(
-                backup_dir, 'node', node, backup_type="delta",
-                options=["-j", "4", "--stream", "--log-level-console=LOG"])
-            # we should die here because exception is what we expect to happen
-            self.assertEqual(
-                1, 0,
-                "Expecting Error because of page "
-                "corruption in PostgreSQL instance.\n"
-                " Output: {0} \n CMD: {1}".format(
-                    repr(self.output), self.cmd))
-        except ProbackupException as e:
-            if self.remote:
-                self.assertTrue(
-                    "LOG: File" in e.message and
-                    "try to fetch via shared buffer" in e.message and
-                    "WARNING:  page verification failed, "
-                    "calculated checksum" in e.message and
-                    "ERROR: query failed: "
-                    "ERROR:  invalid page in block" in e.message and
-                    "query was: SELECT pg_catalog.pg_ptrack_get_block" in e.message,
-                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
-                        repr(e.message), self.cmd))
-            else:
-                self.assertTrue(
-                    "WARNING: File" in e.message and
-                    "blknum" in e.message and
-                    "have wrong checksum" in e.message and
-                    "try to fetch via shared buffer" in e.message and
-                    "WARNING:  page verification failed, "
-                    "calculated checksum" in e.message and
-                    "ERROR: query failed: "
-                    "ERROR:  invalid page in block" in e.message and
-                    "query was: SELECT pg_catalog.pg_ptrack_get_block" in e.message,
-                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
-                        repr(e.message), self.cmd))
-
-        self.assertTrue(
-             self.show_pb(backup_dir, 'node')[1]['status'] == 'ERROR',
-             "Backup Status should be ERROR")
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)

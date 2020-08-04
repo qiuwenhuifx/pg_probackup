@@ -100,7 +100,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(result1, result2)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node, node_restored])
 
     # @unittest.skip("skip")
     def test_page_vacuum_truncate_1(self):
@@ -517,7 +517,8 @@ class PageTest(ProbackupTest, unittest.TestCase):
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True, initdb_params=['--data-checksums'],
+            set_replication=True,
+            initdb_params=['--data-checksums'],
             pg_options={
                 'checkpoint_timeout': '30s',
                 'autovacuum': 'off'
@@ -925,10 +926,13 @@ class PageTest(ProbackupTest, unittest.TestCase):
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
             initdb_params=['--data-checksums'])
 
         alien_node = self.make_simple_node(
-            base_dir=os.path.join(module_name, fname, 'alien_node'))
+            base_dir=os.path.join(module_name, fname, 'alien_node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1206,10 +1210,21 @@ class PageTest(ProbackupTest, unittest.TestCase):
         self.set_archiving(backup_dir, 'node', node)
         node.slow_start()
 
-        node.pgbench_init(scale=50)
+        node.safe_psql("postgres", "create extension pageinspect")
+
+        try:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck")
+        except QueryException as e:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck_next")
+
+        node.pgbench_init(scale=20)
         full_id = self.backup_node(backup_dir, 'node', node)
 
-        pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         self.backup_node(backup_dir, 'node', node, backup_type='delta')
@@ -1223,37 +1238,170 @@ class PageTest(ProbackupTest, unittest.TestCase):
 
         node.slow_start()
 
-        pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # create timelines
-        for i in range(2, 12):
+        for i in range(2, 7):
             node.cleanup()
             self.restore_node(
-                backup_dir, 'node', node, backup_id=full_id,
-                options=['--recovery-target-timeline={0}'.format(i)])
+                backup_dir, 'node', node,
+                options=[
+                    '--recovery-target=latest',
+                    '--recovery-target-action=promote',
+                    '--recovery-target-timeline={0}'.format(i)])
             node.slow_start()
-            pgbench = node.pgbench(options=['-T', '3', '-c', '1', '--no-vacuum'])
+
+            # at this point there is i+1 timeline
+            pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
             pgbench.wait()
+
+            # create backup at 2, 4 and 6 timeline
+            if i % 2 == 0:
+                self.backup_node(backup_dir, 'node', node, backup_type='page')
 
         page_id = self.backup_node(
             backup_dir, 'node', node, backup_type='page',
             options=['--log-level-file=VERBOSE'])
 
         pgdata = self.pgdata_content(node.data_dir)
-        node.cleanup()
-        self.restore_node(backup_dir, 'node', node)
-        pgdata_restored = self.pgdata_content(node.data_dir)
+
+        result = node.safe_psql(
+            "postgres", "select * from pgbench_accounts")
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        self.restore_node(backup_dir, 'node', node_restored)
+        pgdata_restored = self.pgdata_content(node_restored.data_dir)
+
+        self.set_auto_conf(node_restored, {'port': node_restored.port})
+        node_restored.slow_start()
+
+        result_new = node_restored.safe_psql(
+            "postgres", "select * from pgbench_accounts")
+
+        self.assertEqual(result, result_new)
+
         self.compare_pgdata(pgdata, pgdata_restored)
 
-        show = self.show_archive(backup_dir)
+        self.checkdb_node(
+            backup_dir,
+            'node',
+            options=[
+                '--amcheck',
+                '-d', 'postgres', '-p', str(node.port)])
 
-        timelines = show[0]['timelines']
+        self.checkdb_node(
+            backup_dir,
+            'node',
+            options=[
+                '--amcheck',
+                '-d', 'postgres', '-p', str(node_restored.port)])
 
-        # self.assertEqual()
+        backup_list = self.show_pb(backup_dir, 'node')
+
         self.assertEqual(
-            self.show_pb(backup_dir, 'node', page_id)['parent-backup-id'],
-            full_id)
+            backup_list[2]['parent-backup-id'],
+            backup_list[0]['id'])
+        self.assertEqual(backup_list[2]['current-tli'], 3)
+
+        self.assertEqual(
+            backup_list[3]['parent-backup-id'],
+            backup_list[2]['id'])
+        self.assertEqual(backup_list[3]['current-tli'], 5)
+
+        self.assertEqual(
+            backup_list[4]['parent-backup-id'],
+            backup_list[3]['id'])
+        self.assertEqual(backup_list[4]['current-tli'], 7)
+
+        self.assertEqual(
+            backup_list[5]['parent-backup-id'],
+            backup_list[4]['id'])
+        self.assertEqual(backup_list[5]['current-tli'], 7)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.skip("skip")
+    # @unittest.expectedFailure
+    def test_multitimeline_page_1(self):
+        """
+        Check that backup in PAGE mode choose
+        parent backup correctly:
+        t2        /---->
+        t1 -F--P---D->
+
+        P must have F as parent
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        node.safe_psql("postgres", "create extension pageinspect")
+
+        try:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck")
+        except QueryException as e:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck_next")
+
+        node.pgbench_init(scale=20)
+        full_id = self.backup_node(backup_dir, 'node', node)
+
+        pgbench = node.pgbench(options=['-T', '20', '-c', '1'])
+        pgbench.wait()
+
+        page1 = self.backup_node(backup_dir, 'node', node, backup_type='page')
+
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
+        pgbench.wait()
+
+        page1 = self.backup_node(backup_dir, 'node', node, backup_type='delta')
+
+        node.cleanup()
+        self.restore_node(
+            backup_dir, 'node', node, backup_id=page1,
+            options=[
+                '--recovery-target=immediate',
+                '--recovery-target-action=promote'])
+
+        node.slow_start()
+
+        pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
+        pgbench.wait()
+
+        print(self.backup_node(
+            backup_dir, 'node', node, backup_type='page',
+            options=['--log-level-console=LOG'], return_id=False))
+
+        pgdata = self.pgdata_content(node.data_dir)
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        self.restore_node(backup_dir, 'node', node_restored)
+        pgdata_restored = self.pgdata_content(node_restored.data_dir)
+
+        self.set_auto_conf(node_restored, {'port': node_restored.port})
+        node_restored.slow_start()
+
+        self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)

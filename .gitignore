@@ -44,6 +44,18 @@
 /src/xlogreader.c
 /src/walmethods.c
 /src/walmethods.h
+/src/instr_time.h
 
 # Doc files
 /doc/*html
+
+# Docker files
+/docker-compose.yml
+/Dockerfile
+/Dockerfile.in
+/run_tests.sh
+/make_dockerfile.sh
+/backup_restore.sh
+
+# Misc
+.python-version

@@ -430,6 +430,16 @@ print_backup_json_object(PQExpBuffer buf, pgBackup *backup)
 	json_add_value(buf, "status", status2str(backup->status), json_level,
 					true);
 
+	if (backup->note)
+		json_add_value(buf, "note", backup->note,
+					json_level, true);
+
+	if (backup->content_crc != 0)
+	{
+		json_add_key(buf, "content-crc", json_level);
+		appendPQExpBuffer(buf, "%u", backup->content_crc);
+	}
+
 	json_add(buf, JT_END_OBJECT, &json_level);
 }
 
@@ -439,9 +449,25 @@ print_backup_json_object(PQExpBuffer buf, pgBackup *backup)
 static int
 show_backup(const char *instance_name, time_t requested_backup_id)
 {
-	pgBackup   *backup;
+	int i;
+	pgBackup   *backup = NULL;
+	parray	   *backups;
 
-	backup = read_backup(instance_name, requested_backup_id);
+	backups = catalog_get_backup_list(instance_name, INVALID_BACKUP_ID);
+
+	/* Find requested backup */
+	for (i = 0; i < parray_num(backups); i++)
+	{
+		pgBackup   *tmp_backup = (pgBackup *) parray_get(backups, i);
+
+		/* found target */
+		if (tmp_backup->start_time == requested_backup_id)
+		{
+			backup = tmp_backup;
+			break;
+		}
+	}
+
 	if (backup == NULL)
 	{
 		// TODO for 3.0: we should ERROR out here.
@@ -458,7 +484,8 @@ show_backup(const char *instance_name, time_t requested_backup_id)
 		elog(ERROR, "Invalid show format %d", (int) show_format);
 
 	/* cleanup */
-	pgBackupFree(backup);
+	parray_walk(backups, pgBackupFree);
+	parray_free(backups);
 
 	return 0;
 }

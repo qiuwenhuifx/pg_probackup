@@ -845,7 +845,7 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
                     repr(self.output), self.cmd))
         except ProbackupException as e:
             self.assertIn(
-                'ERROR: restore destination is not empty:',
+                'ERROR: Restore destination is not empty:',
                 e.message,
                 '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
                     repr(e.message), self.cmd))
@@ -980,9 +980,9 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
 
         # Create tablespace table
         with node.connect("postgres") as con:
-            con.connection.autocommit = True
-            con.execute("CHECKPOINT")
-            con.connection.autocommit = False
+#            con.connection.autocommit = True
+#            con.execute("CHECKPOINT")
+#            con.connection.autocommit = False
             con.execute("CREATE TABLE tbl1 (a int) TABLESPACE tblspc")
             con.execute(
                 "INSERT INTO tbl1 SELECT * "
@@ -1391,10 +1391,6 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
 
         node.safe_psql(
             'postgres',
-            'checkpoint')
-
-        node.safe_psql(
-            'postgres',
             'insert into tbl select i from generate_series(0,100) as i')
 
         node.safe_psql(
@@ -1747,7 +1743,7 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
         # Take FULL
         self.backup_node(backup_dir, 'node', node)
 
-        node.pgbench_init(scale=3)
+        node.pgbench_init(scale=5)
         # pgbench = node.pgbench(options=['-T', '20', '-c', '2'])
         # pgbench.wait()
 
@@ -1769,11 +1765,10 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
             os.path.join(backup_dir, 'backups', 'node', backup_id),
             os.path.join(backup_dir, 'backups', 'node', new_id))
 
-        pgbench = node.pgbench(options=['-T', '3', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '7', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
-        backup_id = self.backup_node(
-            backup_dir, 'node', node, backup_type='page')
+        backup_id = self.backup_node(backup_dir, 'node', node, backup_type='page')
         pgdata = self.pgdata_content(node.data_dir)
 
         node.cleanup()
@@ -2462,7 +2457,7 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
         node.slow_start()
 
         cat_version = node.get_control_data()["Catalog version number"]
-        version_specific_dir = 'PG_' + str(node.major_version) + '_' + cat_version
+        version_specific_dir = 'PG_' + node.major_version_str + '_' + cat_version
 
         # PG_10_201707211
         # pg_tblspc/33172/PG_9.5_201510051/16386/
@@ -3026,6 +3021,7 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
+            ptrack_enable=self.ptrack,
             initdb_params=['--data-checksums'],
             pg_options={'autovacuum': 'off'})
 
@@ -3277,17 +3273,7 @@ class RestoreTest(ProbackupTest, unittest.TestCase):
         self.backup_node(
             backup_dir, 'node', node, options=['--stream'])
 
-        node.pgbench_init(scale=1)
-
-        node.safe_psql(
-            'postgres',
-            'CHECKPOINT')
-
-        node.pgbench_init(scale=1)
-
-        node.safe_psql(
-            'postgres',
-            'CHECKPOINT')
+        node.pgbench_init(scale=5)
 
         node.safe_psql(
             'postgres',

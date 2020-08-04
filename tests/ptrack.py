@@ -3,10 +3,10 @@ import unittest
 from .helpers.ptrack_helpers import ProbackupTest, ProbackupException, idx_ptrack
 from datetime import datetime, timedelta
 import subprocess
-from testgres import QueryException
+from testgres import QueryException, StartNodeException
 import shutil
 import sys
-import time
+from time import sleep
 from threading import Thread
 
 
@@ -14,6 +14,87 @@ module_name = 'ptrack'
 
 
 class PtrackTest(ProbackupTest, unittest.TestCase):
+
+    # @unittest.skip("skip")
+    def test_ptrack_eat_my_data(self):
+        """
+        PGPRO-4051
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            ptrack_enable=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        if node.major_version >= 12:
+            node.safe_psql(
+                "postgres",
+                "CREATE EXTENSION ptrack")
+
+        node.pgbench_init(scale=50)
+
+        self.backup_node(backup_dir, 'node', node)
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+
+        pgbench = node.pgbench(options=['-T', '300', '-c', '1', '--no-vacuum'])
+
+        for i in range(10):
+            print("Iteration: {0}".format(i))
+
+            sleep(2)
+
+            self.backup_node(backup_dir, 'node', node, backup_type='ptrack')
+#            pgdata = self.pgdata_content(node.data_dir)
+#
+#            node_restored.cleanup()
+#
+#            self.restore_node(backup_dir, 'node', node_restored)
+#            pgdata_restored = self.pgdata_content(node_restored.data_dir)
+#
+#            self.compare_pgdata(pgdata, pgdata_restored)
+
+        pgbench.terminate()
+        pgbench.wait()
+
+        self.switch_wal_segment(node)
+
+        result = node.safe_psql("postgres", "SELECT * FROM pgbench_accounts")
+
+        node_restored.cleanup()
+        self.restore_node(backup_dir, 'node', node_restored)
+        self.set_auto_conf(
+            node_restored, {'port': node_restored.port})
+
+        node_restored.slow_start()
+
+        balance = node_restored.safe_psql(
+            'postgres',
+            'select (select sum(tbalance) from pgbench_tellers) - '
+            '( select sum(bbalance) from pgbench_branches) + '
+            '( select sum(abalance) from pgbench_accounts ) - '
+            '(select sum(delta) from pgbench_history) as must_be_zero').rstrip()
+
+        self.assertEqual('0', balance)
+
+        # Logical comparison
+        self.assertEqual(
+            result,
+            node_restored.safe_psql(
+                'postgres',
+                'SELECT * FROM pgbench_accounts'),
+            'Data loss')
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     def test_ptrack_simple(self):
@@ -210,46 +291,36 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
                 "GRANT EXECUTE ON FUNCTION pg_catalog.txid_snapshot_xmax(txid_snapshot) TO backup;"
             )
 
-        if self.ptrack:
-            fnames = []
-            if node.major_version < 12:
-                fnames += [
-                    'pg_catalog.oideq(oid, oid)',
-                    'pg_catalog.ptrack_version()',
-                    'pg_catalog.pg_ptrack_clear()',
-                    'pg_catalog.pg_ptrack_control_lsn()',
-                    'pg_catalog.pg_ptrack_get_and_clear_db(oid, oid)',
-                    'pg_catalog.pg_ptrack_get_and_clear(oid, oid)',
-                    'pg_catalog.pg_ptrack_get_block_2(oid, oid, oid, bigint)'
-                    ]
-            else:
-                # TODO why backup works without these grants ?
-#                fnames += [
-#                    'pg_ptrack_get_pagemapset(pg_lsn)',
-#                    'pg_ptrack_control_lsn()',
-#                    'pg_ptrack_get_block(oid, oid, oid, bigint)'
-#                    ]
-
-                node.safe_psql(
-                    "backupdb",
-                    "CREATE SCHEMA ptrack")
-
-                node.safe_psql(
-                    "backupdb",
-                    "CREATE EXTENSION ptrack WITH SCHEMA ptrack")
-
-                node.safe_psql(
-                    "backupdb",
-                    "GRANT USAGE ON SCHEMA ptrack TO backup")
+        if node.major_version < 12:
+            fnames = [
+                'pg_catalog.oideq(oid, oid)',
+                'pg_catalog.ptrack_version()',
+                'pg_catalog.pg_ptrack_clear()',
+                'pg_catalog.pg_ptrack_control_lsn()',
+                'pg_catalog.pg_ptrack_get_and_clear_db(oid, oid)',
+                'pg_catalog.pg_ptrack_get_and_clear(oid, oid)',
+                'pg_catalog.pg_ptrack_get_block_2(oid, oid, oid, bigint)'
+                ]
 
             for fname in fnames:
                 node.safe_psql(
                     "backupdb",
                     "GRANT EXECUTE ON FUNCTION {0} TO backup".format(fname))
 
+        else:
             node.safe_psql(
                 "backupdb",
-                "GRANT SELECT ON TABLE pg_catalog.pg_extension TO backup")
+                "CREATE SCHEMA ptrack")
+            node.safe_psql(
+                "backupdb",
+                "CREATE EXTENSION ptrack WITH SCHEMA ptrack")
+            node.safe_psql(
+                "backupdb",
+                "GRANT USAGE ON SCHEMA ptrack TO backup")
+
+        node.safe_psql(
+            "backupdb",
+            "GRANT SELECT ON TABLE pg_catalog.pg_extension TO backup")
 
         if ProbackupTest.enterprise:
             node.safe_psql(
@@ -279,7 +350,8 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True, initdb_params=['--data-checksums'],
             pg_options={
-                'checkpoint_timeout': '30s'})
+                'checkpoint_timeout': '30s',
+                'shared_preload_libraries': 'ptrack'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -346,18 +418,18 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
 
         # DISABLE PTRACK
         if node.major_version >= 12:
-            node.safe_psql('postgres', "alter system set ptrack_map_size to 0")
+            node.safe_psql('postgres', "alter system set ptrack.map_size to 0")
         else:
             node.safe_psql('postgres', "alter system set ptrack_enable to off")
-
         node.stop()
         node.slow_start()
 
         # ENABLE PTRACK
-        if node.major_version < 11:
-            node.safe_psql('postgres', "alter system set ptrack_enable to on")
+        if node.major_version >= 12:
+            node.safe_psql('postgres', "alter system set ptrack.map_size to '128'")
+            node.safe_psql('postgres', "alter system set shared_preload_libraries to 'ptrack'")
         else:
-            node.safe_psql('postgres', "alter system set ptrack_map_size to '128MB'")
+            node.safe_psql('postgres', "alter system set ptrack_enable to on")
         node.stop()
         node.slow_start()
 
@@ -398,7 +470,9 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             ptrack_enable=True,
             initdb_params=['--data-checksums'],
-            pg_options={'wal_level': 'replica'})
+            pg_options={
+                'wal_level': 'replica',
+                'autovacuum': 'off'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -420,29 +494,29 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node', node, backup_type='ptrack',
             options=['--stream'])
 
-        pgdata = self.pgdata_content(node.data_dir)
-
-        self.backup_node(
-            backup_dir, 'node', node, backup_type='ptrack',
-            options=['--stream'])
+        if self.paranoia:
+            pgdata = self.pgdata_content(node.data_dir)
 
         node_restored = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node_restored'))
         node_restored.cleanup()
 
         self.restore_node(
-            backup_dir, 'node', node_restored, options=["-j", "4"])
+            backup_dir, 'node', node_restored,
+            node_restored.data_dir, options=["-j", "4"])
 
-        # Physical comparison
         if self.paranoia:
             pgdata_restored = self.pgdata_content(
-                node_restored.data_dir, ignore_ptrack=False)
-            self.compare_pgdata(pgdata, pgdata_restored)
+                    node_restored.data_dir, ignore_ptrack=False)
 
         self.set_auto_conf(
             node_restored, {'port': node_restored.port})
 
         node_restored.slow_start()
+
+        # Physical comparison
+        if self.paranoia:
+            self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)
@@ -637,6 +711,7 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
         node.slow_start()
 
         if node.major_version >= 12:
+            self.skipTest("skip --- we do not need ptrack_get_block for ptrack 2.*")
             node.safe_psql(
                 "postgres",
                 "CREATE EXTENSION ptrack")
@@ -3952,9 +4027,9 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
                     repr(self.output), self.cmd)
             )
         except ProbackupException as e:
-            self.assertIn(
-                'Insert error message',
-                e.message,
+            self.assertTrue(
+                'ERROR: LSN from ptrack_control ' in e.message and
+                'is greater than Start LSN of previous backup' in e.message,
                 '\n Unexpected Error Message: {0}\n'
                 ' CMD: {1}'.format(repr(e.message), self.cmd))
 
@@ -3976,6 +4051,10 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
     # @unittest.skip("skip")
     # @unittest.expectedFailure
     def test_corrupt_ptrack_map(self):
+
+        if self.pg_config_version < self.version_to_num('12.0'):
+            return unittest.skip('You need PostgreSQL >= 12 for this test')
+
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
@@ -4016,14 +4095,17 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
 
         node.stop(['-m', 'immediate', '-D', node.data_dir])
 
+        ptrack_map = os.path.join(node.data_dir, 'global', 'ptrack.map')
+        ptrack_map_mmap = os.path.join(node.data_dir, 'global', 'ptrack.map.mmap')
+
         # Let`s do index corruption. ptrack.map, ptrack.map.mmap
-        with open(os.path.join(node.data_dir, 'global', 'ptrack.map'), "rb+", 0) as f:
+        with open(ptrack_map, "rb+", 0) as f:
             f.seek(42)
             f.write(b"blablahblahs")
             f.flush()
             f.close
 
-        with open(os.path.join(node.data_dir, 'global', 'ptrack.map.mmap'), "rb+", 0) as f:
+        with open(ptrack_map_mmap, "rb+", 0) as f:
             f.seek(42)
             f.write(b"blablahblahs")
             f.flush()
@@ -4031,13 +4113,97 @@ class PtrackTest(ProbackupTest, unittest.TestCase):
 
 #        os.remove(os.path.join(node.logs_dir, node.pg_log_name))
 
+        try:
+            node.slow_start()
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because ptrack.map is corrupted"
+                "\n Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except StartNodeException as e:
+            self.assertIn(
+                'Cannot start node',
+                e.message,
+                '\n Unexpected Error Message: {0}\n'
+                ' CMD: {1}'.format(repr(e.message), self.cmd))
+
+        log_file = os.path.join(node.logs_dir, 'postgresql.log')
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+
+        self.assertIn(
+            'FATAL:  ptrack init: incorrect checksum of file "{0}"'.format(ptrack_map),
+            log_content)
+
+        self.set_auto_conf(node, {'ptrack.map_size': '0'})
+
         node.slow_start()
+
+        try:
+            self.backup_node(
+                backup_dir, 'node', node,
+                backup_type='ptrack', options=['--stream'])
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because instance ptrack is disabled"
+                "\n Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except ProbackupException as e:
+            self.assertIn(
+                'ERROR: Ptrack is disabled',
+                e.message,
+                '\n Unexpected Error Message: {0}\n'
+                ' CMD: {1}'.format(repr(e.message), self.cmd))
+
+        node.safe_psql(
+            'postgres',
+            "update t_heap set id = nextval('t_seq'), text = md5(text), "
+            "tsvector = md5(repeat(tsvector::text, 10))::tsvector")
+
+        node.stop(['-m', 'immediate', '-D', node.data_dir])
+
+        self.set_auto_conf(node, {'ptrack.map_size': '32', 'shared_preload_libraries': 'ptrack'})
+
+        node.slow_start()
+
+        sleep(1)
+
+        try:
+            self.backup_node(
+                backup_dir, 'node', node,
+                backup_type='ptrack', options=['--stream'])
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because ptrack map is from future"
+                "\n Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except ProbackupException as e:
+            self.assertIn(
+                'ERROR: LSN from ptrack_control',
+                e.message,
+                '\n Unexpected Error Message: {0}\n'
+                ' CMD: {1}'.format(repr(e.message), self.cmd))
+
+        sleep(1)
+
+        self.backup_node(
+            backup_dir, 'node', node,
+            backup_type='delta', options=['--stream'])
+
+        node.safe_psql(
+            'postgres',
+            "update t_heap set id = nextval('t_seq'), text = md5(text), "
+            "tsvector = md5(repeat(tsvector::text, 10))::tsvector")
 
         self.backup_node(
             backup_dir, 'node', node,
             backup_type='ptrack', options=['--stream'])
 
         pgdata = self.pgdata_content(node.data_dir)
+
         node.cleanup()
 
         self.restore_node(backup_dir, 'node', node)

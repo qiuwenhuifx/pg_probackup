@@ -89,14 +89,11 @@ unlink_lock_atexit(void)
  * If no backup matches, return NULL.
  */
 pgBackup *
-read_backup(const char *instance_name, time_t timestamp)
+read_backup(const char *root_dir)
 {
-	pgBackup	tmp;
 	char		conf_path[MAXPGPATH];
 
-	tmp.start_time = timestamp;
-	pgBackupGetPathInInstance(instance_name, &tmp, conf_path,
-					 lengthof(conf_path), BACKUP_CONTROL_FILE, NULL);
+	join_path_components(conf_path, root_dir, BACKUP_CONTROL_FILE);
 
 	return readBackupControlFile(conf_path);
 }
@@ -109,11 +106,11 @@ read_backup(const char *instance_name, time_t timestamp)
  */
 void
 write_backup_status(pgBackup *backup, BackupStatus status,
-					const char *instance_name)
+					const char *instance_name, bool strict)
 {
 	pgBackup   *tmp;
 
-	tmp = read_backup(instance_name, backup->start_time);
+	tmp = read_backup(backup->root_dir);
 	if (!tmp)
 	{
 		/*
@@ -125,7 +122,9 @@ write_backup_status(pgBackup *backup, BackupStatus status,
 
 	backup->status = status;
 	tmp->status = backup->status;
-	write_backup(tmp);
+	tmp->root_dir = pgut_strdup(backup->root_dir);
+
+	write_backup(tmp, strict);
 
 	pgBackupFree(tmp);
 }
@@ -134,7 +133,7 @@ write_backup_status(pgBackup *backup, BackupStatus status,
  * Create exclusive lockfile in the backup's directory.
  */
 bool
-lock_backup(pgBackup *backup)
+lock_backup(pgBackup *backup, bool strict)
 {
 	char		lock_file[MAXPGPATH];
 	int			fd;
@@ -280,6 +279,14 @@ lock_backup(pgBackup *backup)
 		fio_unlink(lock_file, FIO_BACKUP_HOST);
 		/* if write didn't set errno, assume problem is no disk space */
 		errno = save_errno ? save_errno : ENOSPC;
+
+		/* In lax mode if we failed to grab lock because of 'out of space error',
+		 * then treat backup as locked.
+		 * Only delete command should be run in lax mode.
+		 */
+		if (!strict && errno == ENOSPC)
+			return true;
+
 		elog(ERROR, "Could not write lock file \"%s\": %s",
 			 lock_file, strerror(errno));
 	}
@@ -464,6 +471,12 @@ catalog_get_backup_list(const char *instance_name, time_t requested_backup_id)
 
 		backup->root_dir = pgut_strdup(data_path);
 
+		backup->database_dir = pgut_malloc(MAXPGPATH);
+		join_path_components(backup->database_dir, backup->root_dir, DATABASE_DIR);
+
+		/* Initialize page header map */
+		init_header_map(backup);
+
 		/* TODO: save encoded backup id */
 		backup->backup_id = backup->start_time;
 		if (requested_backup_id != INVALID_BACKUP_ID
@@ -531,17 +544,17 @@ err_proc:
  * TODO this function only used once. Is it really needed?
  */
 parray *
-get_backup_filelist(pgBackup *backup)
+get_backup_filelist(pgBackup *backup, bool strict)
 {
 	parray		*files = NULL;
 	char		backup_filelist_path[MAXPGPATH];
 
-	pgBackupGetPath(backup, backup_filelist_path, lengthof(backup_filelist_path), DATABASE_FILE_LIST);
-	files = dir_read_file_list(NULL, NULL, backup_filelist_path, FIO_BACKUP_HOST);
+	join_path_components(backup_filelist_path, backup->root_dir, DATABASE_FILE_LIST);
+	files = dir_read_file_list(NULL, NULL, backup_filelist_path, FIO_BACKUP_HOST, backup->content_crc);
 
 	/* redundant sanity? */
 	if (!files)
-		elog(ERROR, "Failed to get filelist for backup %s", base36enc(backup->start_time));
+		elog(strict ? ERROR : WARNING, "Failed to get file list for backup %s", base36enc(backup->start_time));
 
 	return files;
 }
@@ -550,7 +563,7 @@ get_backup_filelist(pgBackup *backup)
  * Lock list of backups. Function goes in backward direction.
  */
 void
-catalog_lock_backup_list(parray *backup_list, int from_idx, int to_idx)
+catalog_lock_backup_list(parray *backup_list, int from_idx, int to_idx, bool strict)
 {
 	int			start_idx,
 				end_idx;
@@ -565,7 +578,7 @@ catalog_lock_backup_list(parray *backup_list, int from_idx, int to_idx)
 	for (i = start_idx; i >= end_idx; i--)
 	{
 		pgBackup   *backup = (pgBackup *) parray_get(backup_list, i);
-		if (!lock_backup(backup))
+		if (!lock_backup(backup, strict))
 			elog(ERROR, "Cannot lock backup %s directory",
 				 base36enc(backup->start_time));
 	}
@@ -834,10 +847,16 @@ pgBackupCreateDir(pgBackup *backup)
 	fio_mkdir(path, DIR_PERMISSION, FIO_BACKUP_HOST);
 	backup->root_dir = pgut_strdup(path);
 
+	backup->database_dir = pgut_malloc(MAXPGPATH);
+	join_path_components(backup->database_dir, backup->root_dir, DATABASE_DIR);
+
+	/* block header map */
+	init_header_map(backup);
+
 	/* create directories for actual backup files */
 	for (i = 0; i < parray_num(subdirs); i++)
 	{
-		pgBackupGetPath(backup, path, lengthof(path), parray_get(subdirs, i));
+		join_path_components(path, backup->root_dir, parray_get(subdirs, i));
 		fio_mkdir(path, DIR_PERMISSION, FIO_BACKUP_HOST);
 	}
 
@@ -846,7 +865,8 @@ pgBackupCreateDir(pgBackup *backup)
 }
 
 /*
- * Create list of timelines
+ * Create list of timelines.
+ * TODO: '.partial' and '.part' segno information should be added to tlinfo.
  */
 parray *
 catalog_get_timelines(InstanceConfig *instance)
@@ -864,8 +884,8 @@ catalog_get_timelines(InstanceConfig *instance)
 
 	/* read all xlog files that belong to this archive */
 	sprintf(arclog_path, "%s/%s/%s", backup_path, "wal", instance->name);
-	dir_list_file(xlog_files_list, arclog_path, false, false, false, 0, FIO_BACKUP_HOST);
-	parray_qsort(xlog_files_list, pgFileComparePath);
+	dir_list_file(xlog_files_list, arclog_path, false, false, false, false, true, 0, FIO_BACKUP_HOST);
+	parray_qsort(xlog_files_list, pgFileCompareName);
 
 	timelineinfos = parray_new();
 	tlinfo = NULL;
@@ -926,7 +946,8 @@ catalog_get_timelines(InstanceConfig *instance)
 					continue;
 				}
 				/* partial WAL segment */
-				else if (IsPartialXLogFileName(file->name))
+				else if (IsPartialXLogFileName(file->name) ||
+						 IsPartialCompressXLogFileName(file->name))
 				{
 					elog(VERBOSE, "partial WAL file \"%s\"", file->name);
 
@@ -941,6 +962,27 @@ catalog_get_timelines(InstanceConfig *instance)
 					wal_file->file = *file;
 					wal_file->segno = segno;
 					wal_file->type = PARTIAL_SEGMENT;
+					wal_file->keep = false;
+					parray_append(tlinfo->xlog_filelist, wal_file);
+					continue;
+				}
+				/* temp WAL segment */
+				else if (IsTempXLogFileName(file->name) ||
+						 IsTempCompressXLogFileName(file->name))
+				{
+					elog(VERBOSE, "temp WAL file \"%s\"", file->name);
+
+					if (!tlinfo || tlinfo->tli != tli)
+					{
+						tlinfo = timelineInfoNew(tli);
+						parray_append(timelineinfos, tlinfo);
+					}
+
+					/* append file to xlog file list */
+					wal_file = palloc(sizeof(xlogFile));
+					wal_file->file = *file;
+					wal_file->segno = segno;
+					wal_file->type = TEMP_SEGMENT;
 					wal_file->keep = false;
 					parray_append(tlinfo->xlog_filelist, wal_file);
 					continue;
@@ -1012,7 +1054,7 @@ catalog_get_timelines(InstanceConfig *instance)
 			TimeLineHistoryEntry *tln;
 
 			sscanf(file->name, "%08X.history", &tli);
-			timelines = read_timeline_history(arclog_path, tli);
+			timelines = read_timeline_history(arclog_path, tli, true);
 
 			if (!tlinfo || tlinfo->tli != tli)
 			{
@@ -1534,18 +1576,23 @@ do_set_backup(const char *instance_name, time_t backup_id,
 
 	target_backup = (pgBackup *) parray_get(backup_list, 0);
 
-	if (!pin_backup(target_backup, set_backup_params))
-		elog(ERROR, "Failed to pin the backup %s", base36enc(backup_id));
+	/* Pin or unpin backup if requested */
+	if (set_backup_params->ttl >= 0 || set_backup_params->expire_time > 0)
+		pin_backup(target_backup, set_backup_params);
+
+	if (set_backup_params->note)
+		add_note(target_backup, set_backup_params->note);
 }
 
 /*
  * Set 'expire-time' attribute based on set_backup_params, or unpin backup
  * if ttl is equal to zero.
  */
-bool
+void
 pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 {
 
+	/* sanity, backup must have positive recovery-time */
 	if (target_backup->recovery_time <= 0)
 		elog(ERROR, "Failed to set 'expire-time' for backup %s: invalid 'recovery-time'",
 						base36enc(target_backup->backup_id));
@@ -1563,7 +1610,7 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 		{
 			elog(WARNING, "Backup %s is not pinned, nothing to unpin",
 									base36enc(target_backup->start_time));
-			return false;
+			return;
 		}
 		target_backup->expire_time = 0;
 	}
@@ -1571,10 +1618,11 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 	else if (set_backup_params->expire_time > 0)
 		target_backup->expire_time = set_backup_params->expire_time;
 	else
-		return false;
+		/* nothing to do */
+		return;
 
 	/* Update backup.control */
-	write_backup(target_backup);
+	write_backup(target_backup, true);
 
 	if (set_backup_params->ttl > 0 || set_backup_params->expire_time > 0)
 	{
@@ -1587,7 +1635,44 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 	else
 		elog(INFO, "Backup %s is unpinned", base36enc(target_backup->start_time));
 
-	return true;
+	return;
+}
+
+/*
+ * Add note to backup metadata or unset already existing note.
+ * It is a job of the caller to make sure that note is not NULL.
+ */
+void
+add_note(pgBackup *target_backup, char *note)
+{
+
+	char *note_string;
+
+	/* unset note */
+	if (pg_strcasecmp(note, "none") == 0)
+	{
+		target_backup->note = NULL;
+		elog(INFO, "Removing note from backup %s",
+				base36enc(target_backup->start_time));
+	}
+	else
+	{
+		/* Currently we do not allow string with newlines as note,
+		 * because it will break parsing of backup.control.
+		 * So if user provides string like this "aaa\nbbbbb",
+		 * we save only "aaa"
+		 * Example: tests.set_backup.SetBackupTest.test_add_note_newlines
+		 */
+		note_string = pgut_malloc(MAX_NOTE_SIZE);
+		sscanf(note, "%[^\n]", note_string);
+
+		target_backup->note = note_string;
+		elog(INFO, "Adding note to backup %s: '%s'",
+				base36enc(target_backup->start_time), target_backup->note);
+	}
+
+	/* Update backup.control */
+	write_backup(target_backup, true);
 }
 
 /*
@@ -1682,44 +1767,58 @@ pgBackupWriteControl(FILE *out, pgBackup *backup)
 	/* print external directories list */
 	if (backup->external_dir_str)
 		fio_fprintf(out, "external-dirs = '%s'\n", backup->external_dir_str);
+
+	if (backup->note)
+		fio_fprintf(out, "note = '%s'\n", backup->note);
+
+	if (backup->content_crc != 0)
+		fio_fprintf(out, "content-crc = %u\n", backup->content_crc);
+
 }
 
 /*
  * Save the backup content into BACKUP_CONTROL_FILE.
+ * TODO: honor the strict flag
  */
 void
-write_backup(pgBackup *backup)
+write_backup(pgBackup *backup, bool strict)
 {
-	FILE	   *fp = NULL;
-	char		path[MAXPGPATH];
-	char		path_temp[MAXPGPATH];
-	int			errno_temp;
+	FILE   *fp = NULL;
+	char    path[MAXPGPATH];
+	char    path_temp[MAXPGPATH];
+	char    buf[4096];
 
-	pgBackupGetPath(backup, path, lengthof(path), BACKUP_CONTROL_FILE);
+	join_path_components(path, backup->root_dir, BACKUP_CONTROL_FILE);
 	snprintf(path_temp, sizeof(path_temp), "%s.tmp", path);
 
-	fp = fio_fopen(path_temp, PG_BINARY_W, FIO_BACKUP_HOST);
+	fp = fopen(path_temp, PG_BINARY_W);
 	if (fp == NULL)
-		elog(ERROR, "Cannot open configuration file \"%s\": %s",
+		elog(ERROR, "Cannot open control file \"%s\": %s",
 			 path_temp, strerror(errno));
+
+	if (chmod(path_temp, FILE_PERMISSION) == -1)
+		elog(ERROR, "Cannot change mode of \"%s\": %s", path_temp,
+			 strerror(errno));
+
+	setvbuf(fp, buf, _IOFBF, sizeof(buf));
 
 	pgBackupWriteControl(fp, backup);
 
-	if (fio_fflush(fp) || fio_fclose(fp))
-	{
-		errno_temp = errno;
-		fio_unlink(path_temp, FIO_BACKUP_HOST);
-		elog(ERROR, "Cannot write configuration file \"%s\": %s",
-			 path_temp, strerror(errno_temp));
-	}
+	if (fflush(fp) != 0)
+		elog(ERROR, "Cannot flush control file \"%s\": %s",
+			 path_temp, strerror(errno));
 
-	if (fio_rename(path_temp, path, FIO_BACKUP_HOST) < 0)
-	{
-		errno_temp = errno;
-		fio_unlink(path_temp, FIO_BACKUP_HOST);
-		elog(ERROR, "Cannot rename configuration file \"%s\" to \"%s\": %s",
-			 path_temp, path, strerror(errno_temp));
-	}
+	if (fsync(fileno(fp)) < 0)
+		elog(ERROR, "Cannot sync control file \"%s\": %s",
+			 path_temp, strerror(errno));
+
+	if (fclose(fp) != 0)
+		elog(ERROR, "Cannot close control file \"%s\": %s",
+			 path_temp, strerror(errno));
+
+	if (rename(path_temp, path) < 0)
+		elog(ERROR, "Cannot rename file \"%s\" to \"%s\": %s",
+			 path_temp, path, strerror(errno));
 }
 
 /*
@@ -1727,39 +1826,46 @@ write_backup(pgBackup *backup)
  */
 void
 write_backup_filelist(pgBackup *backup, parray *files, const char *root,
-					  parray *external_list)
+					  parray *external_list, bool sync)
 {
 	FILE	   *out;
-	char		path[MAXPGPATH];
-	char		path_temp[MAXPGPATH];
-	int			errno_temp;
+	char		control_path[MAXPGPATH];
+	char		control_path_temp[MAXPGPATH];
 	size_t		i = 0;
 	#define BUFFERSZ 1024*1024
 	char		*buf;
-	size_t		write_len = 0;
 	int64 		backup_size_on_disk = 0;
 	int64 		uncompressed_size_on_disk = 0;
 	int64 		wal_size_on_disk = 0;
 
-	pgBackupGetPath(backup, path, lengthof(path), DATABASE_FILE_LIST);
-	snprintf(path_temp, sizeof(path_temp), "%s.tmp", path);
+	join_path_components(control_path, backup->root_dir, DATABASE_FILE_LIST);
+	snprintf(control_path_temp, sizeof(control_path_temp), "%s.tmp", control_path);
 
-	out = fio_fopen(path_temp, PG_BINARY_W, FIO_BACKUP_HOST);
+	out = fopen(control_path_temp, PG_BINARY_W);
 	if (out == NULL)
-		elog(ERROR, "Cannot open file list \"%s\": %s", path_temp,
+		elog(ERROR, "Cannot open file list \"%s\": %s", control_path_temp,
+			 strerror(errno));
+
+	if (chmod(control_path_temp, FILE_PERMISSION) == -1)
+		elog(ERROR, "Cannot change mode of \"%s\": %s", control_path_temp,
 			 strerror(errno));
 
 	buf = pgut_malloc(BUFFERSZ);
+	setvbuf(out, buf, _IOFBF, BUFFERSZ);
+
+	if (sync)
+		INIT_FILE_CRC32(true, backup->content_crc);
 
 	/* print each file in the list */
-	while(i < parray_num(files))
+	for (i = 0; i < parray_num(files); i++)
 	{
-		pgFile	   *file = (pgFile *) parray_get(files, i);
-		char	   *path = file->path; /* for streamed WAL files */
-		char	line[BLCKSZ];
-		int 	len = 0;
+		int       len = 0;
+		char      line[BLCKSZ];
+		pgFile   *file = (pgFile *) parray_get(files, i);
 
-		i++;
+		/* Ignore disappeared file */
+		if (file->write_size == FILE_NOT_FOUND)
+			continue;
 
 		if (S_ISDIR(file->mode))
 		{
@@ -1774,7 +1880,7 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 			 * Size of WAL files in 'pg_wal' is counted separately
 			 * TODO: in 3.0 add attribute is_walfile
 			 */
-			if (IsXLogFileName(file->name) && (file->external_dir_num == 0))
+			if (IsXLogFileName(file->name) && file->external_dir_num == 0)
 				wal_size_on_disk += file->write_size;
 			else
 			{
@@ -1783,20 +1889,12 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 			}
 		}
 
-		/* for files from PGDATA and external files use rel_path
-		 * streamed WAL files has rel_path relative not to "database/"
-		 * but to "database/pg_wal", so for them use path.
-		 */
-		if ((root && strstr(path, root) == path) ||
-			(file->external_dir_num && external_list))
-				path = file->rel_path;
-
 		len = sprintf(line, "{\"path\":\"%s\", \"size\":\"" INT64_FORMAT "\", "
 					 "\"mode\":\"%u\", \"is_datafile\":\"%u\", "
 					 "\"is_cfs\":\"%u\", \"crc\":\"%u\", "
 					 "\"compress_alg\":\"%s\", \"external_dir_num\":\"%d\", "
 					 "\"dbOid\":\"%u\"",
-					path, file->write_size, file->mode,
+					file->rel_path, file->write_size, file->mode,
 					file->is_datafile ? 1 : 0,
 					file->is_cfs ? 1 : 0,
 					file->crc,
@@ -1810,54 +1908,43 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 		if (file->linked)
 			len += sprintf(line+len, ",\"linked\":\"%s\"", file->linked);
 
-		if (file->n_blocks != BLOCKNUM_INVALID)
+		if (file->n_blocks > 0)
 			len += sprintf(line+len, ",\"n_blocks\":\"%i\"", file->n_blocks);
 
-		len += sprintf(line+len, "}\n");
-
-		if (write_len + len >= BUFFERSZ)
+		if (file->n_headers > 0)
 		{
-			/* write buffer to file */
-			if (fio_fwrite(out, buf, write_len) != write_len)
-			{
-				errno_temp = errno;
-				fio_unlink(path_temp, FIO_BACKUP_HOST);
-				elog(ERROR, "Cannot write file list \"%s\": %s",
-					path_temp, strerror(errno));
-			}
-			/* reset write_len */
-			write_len = 0;
+			len += sprintf(line+len, ",\"n_headers\":\"%i\"", file->n_headers);
+			len += sprintf(line+len, ",\"hdr_crc\":\"%u\"", file->hdr_crc);
+			len += sprintf(line+len, ",\"hdr_off\":\"%li\"", file->hdr_off);
+			len += sprintf(line+len, ",\"hdr_size\":\"%i\"", file->hdr_size);
 		}
 
-		memcpy(buf+write_len, line, len);
-		write_len += len;
+		sprintf(line+len, "}\n");
+
+		if (sync)
+			COMP_FILE_CRC32(true, backup->content_crc, line, strlen(line));
+
+		fprintf(out, "%s", line);
 	}
 
-	/* write what is left in the buffer to file */
-	if (write_len > 0)
-		if (fio_fwrite(out, buf, write_len) != write_len)
-		{
-			errno_temp = errno;
-			fio_unlink(path_temp, FIO_BACKUP_HOST);
-			elog(ERROR, "Cannot write file list \"%s\": %s",
-				path_temp, strerror(errno));
-		}
+	if (sync)
+		FIN_FILE_CRC32(true, backup->content_crc);
 
-	if (fio_fflush(out) || fio_fclose(out))
-	{
-		errno_temp = errno;
-		fio_unlink(path_temp, FIO_BACKUP_HOST);
-		elog(ERROR, "Cannot write file list \"%s\": %s",
-			 path_temp, strerror(errno));
-	}
+	if (fflush(out) != 0)
+		elog(ERROR, "Cannot flush file list \"%s\": %s",
+			 control_path_temp, strerror(errno));
 
-	if (fio_rename(path_temp, path, FIO_BACKUP_HOST) < 0)
-	{
-		errno_temp = errno;
-		fio_unlink(path_temp, FIO_BACKUP_HOST);
-		elog(ERROR, "Cannot rename configuration file \"%s\" to \"%s\": %s",
-			 path_temp, path, strerror(errno_temp));
-	}
+	if (sync && fsync(fileno(out)) < 0)
+		elog(ERROR, "Cannot sync file list \"%s\": %s",
+			 control_path_temp, strerror(errno));
+
+	if (fclose(out) != 0)
+		elog(ERROR, "Cannot close file list \"%s\": %s",
+			 control_path_temp, strerror(errno));
+
+	if (rename(control_path_temp, control_path) < 0)
+		elog(ERROR, "Cannot rename file \"%s\" to \"%s\": %s",
+			 control_path_temp, control_path, strerror(errno));
 
 	/* use extra variable to avoid reset of previous data_bytes value in case of error */
 	backup->data_bytes = backup_size_on_disk;
@@ -1919,6 +2006,8 @@ readBackupControlFile(const char *path)
 		{'b', 0, "from-replica",		&backup->from_replica, SOURCE_FILE_STRICT},
 		{'s', 0, "primary-conninfo",	&backup->primary_conninfo, SOURCE_FILE_STRICT},
 		{'s', 0, "external-dirs",		&backup->external_dir_str, SOURCE_FILE_STRICT},
+		{'s', 0, "note",				&backup->note, SOURCE_FILE_STRICT},
+		{'u', 0, "content-crc",			&backup->content_crc, SOURCE_FILE_STRICT},
 		{0}
 	};
 
@@ -2184,7 +2273,10 @@ pgBackupInit(pgBackup *backup)
 	backup->server_version[0] = '\0';
 	backup->external_dir_str = NULL;
 	backup->root_dir = NULL;
+	backup->database_dir = NULL;
 	backup->files = NULL;
+	backup->note = NULL;
+	backup->content_crc = 0;
 }
 
 /* free pgBackup object */
@@ -2193,10 +2285,12 @@ pgBackupFree(void *backup)
 {
 	pgBackup *b = (pgBackup *) backup;
 
-	pfree(b->primary_conninfo);
-	pfree(b->external_dir_str);
-	pfree(b->root_dir);
-	pfree(backup);
+	pg_free(b->primary_conninfo);
+	pg_free(b->external_dir_str);
+	pg_free(b->root_dir);
+	pg_free(b->database_dir);
+	pg_free(b->note);
+	pg_free(backup);
 }
 
 /* Compare two pgBackup with their IDs (start time) in ascending order */
@@ -2446,4 +2540,24 @@ get_backup_index_number(parray *backup_list, pgBackup *backup)
 	}
 	elog(WARNING, "Failed to find backup %s", base36enc(backup->start_time));
 	return -1;
+}
+
+/* On backup_list lookup children of target_backup and append them to append_list */
+void
+append_children(parray *backup_list, pgBackup *target_backup, parray *append_list)
+{
+	int i;
+
+	for (i = 0; i < parray_num(backup_list); i++)
+	{
+		pgBackup *backup = (pgBackup *) parray_get(backup_list, i);
+
+		/* check if backup is descendant of target backup */
+		if (is_parent(target_backup->start_time, backup, false))
+		{
+			/* if backup is already in the list, then skip it */
+			if (!parray_contains(append_list, backup))
+				parray_append(append_list, backup);
+		}
+	}
 }

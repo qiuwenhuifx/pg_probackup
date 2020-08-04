@@ -28,6 +28,8 @@ typedef struct
 //	size_t		in_place_merge_bytes;
 	bool		compression_match;
 	bool		program_version_match;
+	bool        use_bitmap;
+	bool        is_retry;
 
 	/*
 	 * Return value from the thread.
@@ -47,7 +49,8 @@ get_external_index(const char *key, const parray *list);
 static void
 merge_data_file(parray *parent_chain, pgBackup *full_backup,
 				pgBackup *dest_backup, pgFile *dest_file,
-				pgFile *tmp_file, const char *to_root);
+				pgFile *tmp_file, const char *to_root, bool use_bitmap,
+				bool is_retry);
 
 static void
 merge_non_data_file(parray *parent_chain, pgBackup *full_backup,
@@ -397,7 +400,7 @@ do_merge(time_t backup_id)
 	parray_append(merge_list, full_backup);
 
 	/* Lock merge chain */
-	catalog_lock_backup_list(merge_list, parray_num(merge_list) - 1, 0);
+	catalog_lock_backup_list(merge_list, parray_num(merge_list) - 1, 0, true);
 
 	/* do actual merge */
 	merge_chain(merge_list, full_backup, dest_backup);
@@ -439,6 +442,8 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 				*dest_externals = NULL;
 
 	parray		*result_filelist = NULL;
+	bool        use_bitmap = true;
+	bool        is_retry = false;
 //	size_t 		total_in_place_merge_bytes = 0;
 
 	pthread_t	*threads = NULL;
@@ -462,7 +467,15 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	if (!dest_backup)
 		elog(ERROR, "Destination backup is missing, cannot continue merge");
 
-	elog(INFO, "Merging backup %s with parent chain", base36enc(dest_backup->start_time));
+	if (dest_backup->status == BACKUP_STATUS_MERGING ||
+		full_backup->status == BACKUP_STATUS_MERGING ||
+		full_backup->status == BACKUP_STATUS_MERGED)
+	{
+		is_retry = true;
+		elog(INFO, "Retry failed merge of backup %s with parent chain", base36enc(dest_backup->start_time));
+	}
+	else
+		elog(INFO, "Merging backup %s with parent chain", base36enc(dest_backup->start_time));
 
 	/* sanity */
 	if (full_backup->merge_dest_backup != INVALID_BACKUP_ID &&
@@ -519,29 +532,41 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	 * If current program version differs from destination backup version,
 	 * then in-place merge is not possible.
 	 */
-	if (parse_program_version(dest_backup->program_version) ==
-		parse_program_version(PROGRAM_VERSION))
+	if ((parse_program_version(full_backup->program_version) ==
+		 parse_program_version(dest_backup->program_version)) &&
+		(parse_program_version(dest_backup->program_version) ==
+		 parse_program_version(PROGRAM_VERSION)))
 		program_version_match = true;
 	else
 		elog(WARNING, "In-place merge is disabled because of program "
-					"versions mismatch: backup %s was produced by version %s, "
-					"but current program version is %s",
-					base36enc(dest_backup->start_time),
-					dest_backup->program_version, PROGRAM_VERSION);
+					"versions mismatch. Full backup version: %s, "
+					"destination backup version: %s, "
+					"current program version: %s",
+					full_backup->program_version,
+					dest_backup->program_version,
+					PROGRAM_VERSION);
 
-	/* Construct path to database dir: /backup_dir/instance_name/FULL/database */
-	join_path_components(full_database_dir, full_backup->root_dir, DATABASE_DIR);
-	/* Construct path to external dir: /backup_dir/instance_name/FULL/external */
-	join_path_components(full_external_prefix, full_backup->root_dir, EXTERNAL_DIR);
-
-	elog(INFO, "Validate parent chain for backup %s",
-					base36enc(dest_backup->start_time));
+	/* Forbid merge retry for failed merges between 2.4.0 and any
+	 * older version. Several format changes makes it impossible
+	 * to determine the exact format any speific file is got.
+	 */
+	if (is_retry &&
+		parse_program_version(dest_backup->program_version) >= 20400 &&
+		parse_program_version(full_backup->program_version) < 20400)
+	{
+		elog(ERROR, "Retry of failed merge for backups with different between minor "
+			"versions is forbidden to avoid data corruption because of storage format "
+			"changes introduced in 2.4.0 version, please take a new full backup");
+	}
 
 	/*
 	 * Validate or revalidate all members of parent chain
 	 * with sole exception of FULL backup. If it has MERGING status
 	 * then it isn't valid backup until merging is finished.
 	 */
+	elog(INFO, "Validate parent chain for backup %s",
+					base36enc(dest_backup->start_time));
+
 	for (i = parray_num(parent_chain) - 1; i >= 0; i--)
 	{
 		pgBackup   *backup = (pgBackup *) parray_get(parent_chain, i);
@@ -565,13 +590,9 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	 */
 	for (i = parray_num(parent_chain) - 1; i >= 0; i--)
 	{
-		char		control_file[MAXPGPATH];
-
 		pgBackup   *backup = (pgBackup *) parray_get(parent_chain, i);
 
-		join_path_components(control_file, backup->root_dir, DATABASE_FILE_LIST);
-		backup->files = dir_read_file_list(NULL, NULL, control_file, FIO_BACKUP_HOST);
-
+		backup->files = get_backup_filelist(backup, true);
 		parray_qsort(backup->files, pgFileCompareRelPathWithExternal);
 
 		/* Set MERGING status for every member of the chain */
@@ -583,15 +604,20 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 			 */
 			backup->merge_dest_backup = dest_backup->start_time;
 			backup->status = BACKUP_STATUS_MERGING;
-			write_backup(backup);
+			write_backup(backup, true);
 		}
 		else
-			write_backup_status(backup, BACKUP_STATUS_MERGING, instance_name);
+			write_backup_status(backup, BACKUP_STATUS_MERGING, instance_name, true);
 	}
+
+	/* Construct path to database dir: /backup_dir/instance_name/FULL/database */
+	join_path_components(full_database_dir, full_backup->root_dir, DATABASE_DIR);
+	/* Construct path to external dir: /backup_dir/instance_name/FULL/external */
+	join_path_components(full_external_prefix, full_backup->root_dir, EXTERNAL_DIR);
 
 	/* Create directories */
 	create_data_directories(dest_backup->files, full_database_dir,
-							dest_backup->root_dir, false, FIO_BACKUP_HOST);
+							dest_backup->root_dir, false, false, FIO_BACKUP_HOST);
 
 	/* External directories stuff */
 	if (dest_backup->external_dir_str)
@@ -604,6 +630,10 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	 */
 	if (full_externals && dest_externals)
 		reorder_external_dirs(full_backup, full_externals, dest_externals);
+
+	/* bitmap optimization rely on n_blocks, which is generally available since 2.3.0 */
+	if (parse_program_version(dest_backup->program_version) < 20300)
+		use_bitmap = false;
 
 	/* Setup threads */
 	for (i = 0; i < parray_num(dest_backup->files); i++)
@@ -643,6 +673,8 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 
 		arg->compression_match = compression_match;
 		arg->program_version_match = program_version_match;
+		arg->use_bitmap = use_bitmap;
+		arg->is_retry = is_retry;
 		/* By default there are some error */
 		arg->ret = 1;
 
@@ -678,6 +710,29 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 		elog(ERROR, "Backup files merging failed, time elapsed: %s",
 				pretty_time);
 
+	/* If temp header map is open, then close it and make rename */
+	if (full_backup->hdr_map.fp)
+	{
+		cleanup_header_map(&(full_backup->hdr_map));
+
+		/* sync new header map to disk */
+		if (fio_sync(full_backup->hdr_map.path_tmp, FIO_BACKUP_HOST) != 0)
+			elog(ERROR, "Cannot sync temp header map \"%s\": %s",
+				full_backup->hdr_map.path_tmp, strerror(errno));
+
+		/* Replace old header map with new one */
+		if (rename(full_backup->hdr_map.path_tmp, full_backup->hdr_map.path))
+			elog(ERROR, "Could not rename file \"%s\" to \"%s\": %s",
+				 full_backup->hdr_map.path_tmp, full_backup->hdr_map.path, strerror(errno));
+	}
+
+	/* Close page header maps */
+	for (i = parray_num(parent_chain) - 1; i >= 0; i--)
+	{
+		pgBackup   *backup = (pgBackup *) parray_get(parent_chain, i);
+		cleanup_header_map(&(backup->hdr_map));
+	}
+
 	/*
 	 * Update FULL backup metadata.
 	 * We cannot set backup status to OK just yet,
@@ -690,6 +745,8 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	full_backup->stop_lsn = dest_backup->stop_lsn;
 	full_backup->recovery_time = dest_backup->recovery_time;
 	full_backup->recovery_xid = dest_backup->recovery_xid;
+	full_backup->tli = dest_backup->tli;
+	full_backup->from_replica = dest_backup->from_replica;
 
 	pfree(full_backup->external_dir_str);
 	full_backup->external_dir_str = pgut_strdup(dest_backup->external_dir_str);
@@ -701,6 +758,19 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 
 	full_backup->compress_alg = dest_backup->compress_alg;
 	full_backup->compress_level = dest_backup->compress_level;
+
+	/* If incremental backup is pinned,
+	 * then result FULL backup must also be pinned.
+	 * And reverse, if FULL backup was pinned and dest was not,
+	 * then pinning is no more.
+	 */
+	full_backup->expire_time = dest_backup->expire_time;
+
+	pg_free(full_backup->note);
+	full_backup->note = NULL;
+
+	if (dest_backup->note)
+		full_backup->note = pgut_strdup(dest_backup->note);
 
 	/* FULL backup must inherit wal mode. */
 	full_backup->stream = dest_backup->stream;
@@ -714,8 +784,8 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 
 	parray_qsort(result_filelist, pgFileCompareRelPathWithExternal);
 
-	write_backup_filelist(full_backup, result_filelist, full_database_dir, NULL);
-	write_backup(full_backup);
+	write_backup_filelist(full_backup, result_filelist, full_database_dir, NULL, true);
+	write_backup(full_backup, true);
 
 	/* Delete FULL backup files, that do not exists in destination backup
 	 * Both arrays must be sorted in in reversed order to delete from leaf
@@ -741,7 +811,7 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 			/* We need full path, file object has relative path */
 			join_path_components(full_file_path, full_database_dir, full_file->rel_path);
 
-			pgFileDelete(full_file, full_file_path);
+			pgFileDelete(full_file->mode, full_file_path);
 			elog(VERBOSE, "Deleted \"%s\"", full_file_path);
 		}
 	}
@@ -751,7 +821,7 @@ merge_chain(parray *parent_chain, pgBackup *full_backup, pgBackup *dest_backup)
 	 * Files are merged into FULL backup. It is time to remove incremental chain.
 	 */
 	full_backup->status = BACKUP_STATUS_MERGED;
-	write_backup(full_backup);
+	write_backup(full_backup, true);
 
 merge_delete:
 	for (i = parray_num(parent_chain) - 2; i >= 0; i--)
@@ -778,6 +848,10 @@ merge_rename:
 		if (rename(full_backup->root_dir, dest_backup->root_dir) == -1)
 			elog(ERROR, "Could not rename directory \"%s\" to \"%s\": %s",
 				 full_backup->root_dir, dest_backup->root_dir, strerror(errno));
+
+		/* update root_dir after rename */
+		pg_free(full_backup->root_dir);
+		full_backup->root_dir = pgut_strdup(dest_backup->root_dir);
 	}
 	else
 	{
@@ -795,7 +869,14 @@ merge_rename:
 		if (rename(full_backup->root_dir, destination_path) == -1)
 			elog(ERROR, "Could not rename directory \"%s\" to \"%s\": %s",
 				 full_backup->root_dir, destination_path, strerror(errno));
+
+		/* update root_dir after rename */
+		pg_free(full_backup->root_dir);
+		full_backup->root_dir = pgut_strdup(destination_path);
 	}
+
+	/* Reinit path to database_dir */
+	join_path_components(full_backup->database_dir, full_backup->root_dir, DATABASE_DIR);
 
 	/* If we crash here, it will produce full backup in MERGED
 	 * status, located in directory with wrong backup id.
@@ -812,7 +893,7 @@ merge_rename:
 	full_backup->status = BACKUP_STATUS_OK;
 	full_backup->start_time = full_backup->merge_dest_backup;
 	full_backup->merge_dest_backup = INVALID_BACKUP_ID;
-	write_backup(full_backup);
+	write_backup(full_backup, true);
 	/* Critical section end */
 
 	/* Cleanup */
@@ -870,7 +951,7 @@ merge_files(void *arg)
 		if (!pg_atomic_test_set_flag(&dest_file->lock))
 			continue;
 
-		tmp_file = pgFileInit(dest_file->rel_path, dest_file->rel_path);
+		tmp_file = pgFileInit(dest_file->rel_path);
 		tmp_file->mode = dest_file->mode;
 		tmp_file->is_datafile = dest_file->is_datafile;
 		tmp_file->is_cfs = dest_file->is_cfs;
@@ -905,7 +986,8 @@ merge_files(void *arg)
 		 * In-place merge is also impossible, if program version of destination
 		 * backup differs from PROGRAM_VERSION
 		 */
-		if (arguments->program_version_match && arguments->compression_match)
+		if (arguments->program_version_match && arguments->compression_match &&
+			!arguments->is_retry)
 		{
 			/*
 			 * Case 1:
@@ -970,6 +1052,8 @@ merge_files(void *arg)
 		/*
 		 * In-place merge means that file in FULL backup stays as it is,
 		 * no additional actions are required.
+		 * page header map cannot be trusted when retrying, so no
+		 * in place merge for retry.
 		 */
 		if (in_place)
 		{
@@ -983,6 +1067,7 @@ merge_files(void *arg)
 			if (file &&
 				file->n_blocks == dest_file->n_blocks)
 			{
+				BackupPageHeader2 *headers = NULL;
 
 				elog(VERBOSE, "The file didn`t changed since FULL backup, skip merge: \"%s\"",
 								file->rel_path);
@@ -995,9 +1080,25 @@ merge_files(void *arg)
 					tmp_file->n_blocks = file->n_blocks;
 					tmp_file->compress_alg = file->compress_alg;
 					tmp_file->uncompressed_size = file->n_blocks * BLCKSZ;
+
+					tmp_file->n_headers = file->n_headers;
+					tmp_file->hdr_crc = file->hdr_crc;
 				}
 				else
 					tmp_file->uncompressed_size = tmp_file->write_size;
+
+				/* Copy header metadata from old map into a new one */
+				tmp_file->n_headers = file->n_headers;
+				headers = get_data_file_headers(&(arguments->full_backup->hdr_map), file,
+						parse_program_version(arguments->full_backup->program_version),
+						true);
+
+				/* sanity */
+				if (!headers && file->n_headers > 0)
+					elog(ERROR, "Failed to get headers for file \"%s\"", file->rel_path);
+
+				write_page_headers(headers, tmp_file, &(arguments->full_backup->hdr_map), true);
+				pg_free(headers);
 
 				//TODO: report in_place merge bytes.
 				goto done;
@@ -1009,7 +1110,9 @@ merge_files(void *arg)
 							arguments->full_backup,
 							arguments->dest_backup,
 							dest_file, tmp_file,
-							arguments->full_database_dir);
+							arguments->full_database_dir,
+							arguments->use_bitmap,
+							arguments->is_retry);
 		else
 			merge_non_data_file(arguments->parent_chain,
 								arguments->full_backup,
@@ -1036,15 +1139,15 @@ remove_dir_with_files(const char *path)
 	int			i;
 	char 		full_path[MAXPGPATH];
 
-	dir_list_file(files, path, true, true, true, 0, FIO_LOCAL_HOST);
-	parray_qsort(files, pgFileComparePathDesc);
+	dir_list_file(files, path, false, false, true, false, false, 0, FIO_LOCAL_HOST);
+	parray_qsort(files, pgFileCompareRelPathWithExternalDesc);
 	for (i = 0; i < parray_num(files); i++)
 	{
 		pgFile	   *file = (pgFile *) parray_get(files, i);
 
 		join_path_components(full_path, path, file->rel_path);
 
-		pgFileDelete(file, full_path);
+		pgFileDelete(file->mode, full_path);
 		elog(VERBOSE, "Deleted \"%s\"", full_path);
 	}
 
@@ -1109,13 +1212,13 @@ reorder_external_dirs(pgBackup *to_backup, parray *to_external,
 void
 merge_data_file(parray *parent_chain, pgBackup *full_backup,
 				pgBackup *dest_backup, pgFile *dest_file, pgFile *tmp_file,
-				const char *full_database_dir)
+				const char *full_database_dir, bool use_bitmap, bool is_retry)
 {
-	FILE	*out = NULL;
-	char	to_fullpath[MAXPGPATH];
-	char	to_fullpath_tmp1[MAXPGPATH]; /* used for restore */
-	char	to_fullpath_tmp2[MAXPGPATH]; /* used for backup */
-	char 	buffer[STDIO_BUFSIZE];
+	FILE   *out = NULL;
+	char   *buffer = pgut_malloc(STDIO_BUFSIZE);
+	char    to_fullpath[MAXPGPATH];
+	char    to_fullpath_tmp1[MAXPGPATH]; /* used for restore */
+	char    to_fullpath_tmp2[MAXPGPATH]; /* used for backup */
 
 	/* The next possible optimization is copying "as is" the file
 	 * from intermediate incremental backup, that didn`t changed in
@@ -1135,13 +1238,29 @@ merge_data_file(parray *parent_chain, pgBackup *full_backup,
 	setvbuf(out, buffer, _IOFBF, STDIO_BUFSIZE);
 
 	/* restore file into temp file */
-	tmp_file->size = restore_data_file(parent_chain, dest_file, out, to_fullpath_tmp1);
-	fclose(out);
+	tmp_file->size = restore_data_file(parent_chain, dest_file, out, to_fullpath_tmp1,
+									   use_bitmap, NULL, InvalidXLogRecPtr, NULL,
+									   /* when retrying merge header map cannot be trusted */
+									   is_retry ? false : true);
+	if (fclose(out) != 0)
+		elog(ERROR, "Cannot close file \"%s\": %s",
+			 to_fullpath_tmp1, strerror(errno));
+
+	pg_free(buffer);
+
+	/* tmp_file->size is greedy, even if there is single 8KB block in file,
+	 * that was overwritten twice during restore_data_file, we would assume that its size is
+	 * 16KB.
+	 * TODO: maybe we should just trust dest_file->n_blocks?
+	 * No, we can`t, because current binary can be used to merge
+	 * 2 backups of old versions, where n_blocks is missing.
+	 */
 
 	backup_data_file(NULL, tmp_file, to_fullpath_tmp1, to_fullpath_tmp2,
 				 InvalidXLogRecPtr, BACKUP_MODE_FULL,
 				 dest_backup->compress_alg, dest_backup->compress_level,
-				 dest_backup->checksum_version, 0, NULL, false);
+				 dest_backup->checksum_version, 0, NULL,
+				 &(full_backup->hdr_map), true);
 
 	/* drop restored temp file */
 	if (unlink(to_fullpath_tmp1) == -1)
@@ -1229,7 +1348,7 @@ merge_non_data_file(parray *parent_chain, pgBackup *full_backup,
 		 */
 		if (!from_file)
 		{
-			elog(ERROR, "Failed to locate non-data file \"%s\" in backup %s",
+			elog(ERROR, "Failed to locate nonedata file \"%s\" in backup %s",
 				dest_file->rel_path, base36enc(from_backup->start_time));
 			continue;
 		}
@@ -1240,11 +1359,11 @@ merge_non_data_file(parray *parent_chain, pgBackup *full_backup,
 
 	/* sanity */
 	if (!from_backup)
-		elog(ERROR, "Failed to found a backup containing full copy of non-data file \"%s\"",
+		elog(ERROR, "Failed to found a backup containing full copy of nonedata file \"%s\"",
 			dest_file->rel_path);
 
 	if (!from_file)
-		elog(ERROR, "Failed to locate a full copy of non-data file \"%s\"", dest_file->rel_path);
+		elog(ERROR, "Failed to locate a full copy of nonedata file \"%s\"", dest_file->rel_path);
 
 	/* set path to source file */
 	if (from_file->external_dir_num)

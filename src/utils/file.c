@@ -2,12 +2,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#ifdef WIN32
-#define __thread __declspec(thread)
-#else
-#include <pthread.h>
-#endif
-
 #include "pg_probackup.h"
 #include "file.h"
 #include "storage/checksum.h"
@@ -32,7 +26,53 @@ typedef struct
 	int         calg;
 	int         clevel;
 	int         bitmapsize;
+	int         path_len;
 } fio_send_request;
+
+
+typedef struct
+{
+	char path[MAXPGPATH];
+	bool exclude;
+	bool follow_symlink;
+	bool add_root;
+	bool backup_logs;
+	bool exclusive_backup;
+	bool skip_hidden;
+	int  external_dir_num;
+} fio_list_dir_request;
+
+typedef struct
+{
+	mode_t  mode;
+	size_t  size;
+	time_t  mtime;
+	bool    is_datafile;
+	bool    is_database;
+	Oid     tblspcOid;
+	Oid     dbOid;
+	Oid     relOid;
+	ForkName   forkName;
+	int     segno;
+	int     external_dir_num;
+	int     linked_len;
+} fio_pgFile;
+
+typedef struct
+{
+	BlockNumber n_blocks;
+	BlockNumber segmentno;
+	XLogRecPtr  stop_lsn;
+	uint32      checksumVersion;
+} fio_checksum_map_request;
+
+typedef struct
+{
+	BlockNumber n_blocks;
+	BlockNumber segmentno;
+	XLogRecPtr  shift_lsn;
+	uint32      checksumVersion;
+} fio_lsn_map_request;
 
 
 /* Convert FIO pseudo handle to index in file descriptor array */
@@ -61,6 +101,7 @@ void fio_error(int rc, int size, char const* file, int line)
 	else
 	{
 		char buf[PRINTF_BUF_SIZE+1];
+//		Assert(false);
 		int err_size = read(fio_stderr, buf, PRINTF_BUF_SIZE);
 		if (err_size > 0)
 		{
@@ -136,13 +177,22 @@ static int remove_file_or_dir(char const* path)
 #endif
 
 /* Check if specified location is local for current node */
-static bool fio_is_remote(fio_location location)
+bool fio_is_remote(fio_location location)
 {
 	bool is_remote = MyLocation != FIO_LOCAL_HOST
 		&& location != FIO_LOCAL_HOST
 		&& location != MyLocation;
 	if (is_remote && !fio_stdin && !launch_agent())
 		elog(ERROR, "Failed to establish SSH connection: %s", strerror(errno));
+	return is_remote;
+}
+
+/* Check if specified location is local for current node */
+bool fio_is_remote_simple(fio_location location)
+{
+	bool is_remote = MyLocation != FIO_LOCAL_HOST
+		&& location != FIO_LOCAL_HOST
+		&& location != MyLocation;
 	return is_remote;
 }
 
@@ -153,14 +203,16 @@ static ssize_t fio_read_all(int fd, void* buf, size_t size)
 	while (offs < size)
 	{
 		ssize_t rc = read(fd, (char*)buf + offs, size - offs);
-		if (rc < 0) {
-			if (errno == EINTR) {
+		if (rc < 0)
+		{
+			if (errno == EINTR)
 				continue;
-			}
+			elog(ERROR, "fio_read_all error, fd %i: %s", fd, strerror(errno));
 			return rc;
-		} else if (rc == 0) {
-			break;
 		}
+		else if (rc == 0)
+			break;
+
 		offs += rc;
 	}
 	return offs;
@@ -173,15 +225,31 @@ static ssize_t fio_write_all(int fd, void const* buf, size_t size)
 	while (offs < size)
 	{
 		ssize_t rc = write(fd, (char*)buf + offs, size - offs);
-		if (rc <= 0) {
-			if (errno == EINTR) {
+		if (rc <= 0)
+		{
+			if (errno == EINTR)
 				continue;
-			}
+
+			elog(ERROR, "fio_write_all error, fd %i: %s", fd, strerror(errno));
+
 			return rc;
 		}
 		offs += rc;
 	}
 	return offs;
+}
+
+/* Get version of remote agent */
+int fio_get_agent_version(void)
+{
+	fio_header hdr;
+	hdr.cop = FIO_AGENT_VERSION;
+	hdr.size = 0;
+
+	IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+	IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+	return hdr.arg;
 }
 
 /* Open input stream. Remote file is fetched to the in-memory buffer and then accessed through Linux fmemopen */
@@ -248,7 +316,8 @@ DIR* fio_opendir(char const* path, fio_location location)
 		mask = fio_fdset;
 		for (i = 0; (mask & 1) != 0; i++, mask >>= 1);
 		if (i == FIO_FDMAX) {
-			return NULL;
+			elog(ERROR, "Descriptor pool for remote files is exhausted, "
+					"probably too many remote directories are opened");
 		}
 		hdr.cop = FIO_OPENDIR;
 		hdr.handle = i;
@@ -263,6 +332,7 @@ DIR* fio_opendir(char const* path, fio_location location)
 		if (hdr.arg != 0)
 		{
 			errno = hdr.arg;
+			fio_fdset &= ~(1 << hdr.handle);
 			return NULL;
 		}
 		dir = (DIR*)(size_t)(i + 1);
@@ -334,9 +404,10 @@ int fio_open(char const* path, int mode, fio_location location)
 
 		mask = fio_fdset;
 		for (i = 0; (mask & 1) != 0; i++, mask >>= 1);
-		if (i == FIO_FDMAX) {
-			return -1;
-		}
+		if (i == FIO_FDMAX)
+			elog(ERROR, "Descriptor pool for remote files is exhausted, "
+					"probably too many remote files are opened");
+
 		hdr.cop = FIO_OPEN;
 		hdr.handle = i;
 		hdr.size = strlen(path) + 1;
@@ -354,6 +425,7 @@ int fio_open(char const* path, int mode, fio_location location)
 		if (hdr.arg != 0)
 		{
 			errno = hdr.arg;
+			fio_fdset &= ~(1 << hdr.handle);
 			return -1;
 		}
 		fd = i | FIO_PIPE_MARKER;
@@ -632,7 +704,7 @@ ssize_t fio_write(int fd, void const* buf, size_t size)
 	}
 }
 
-static int32
+int32
 fio_decompress(void* dst, void const* src, size_t size, int compress_alg)
 {
 	const char *errormsg = NULL;
@@ -727,44 +799,6 @@ ssize_t fio_read(int fd, void* buf, size_t size)
 	}
 }
 
-/* Get information about stdio file */
-int fio_ffstat(FILE* f, struct stat* st)
-{
-	return fio_is_remote_file(f)
-		? fio_fstat(fio_fileno(f), st)
-		: fio_fstat(fileno(f), st);
-}
-
-/* Get information about file descriptor */
-int fio_fstat(int fd, struct stat* st)
-{
-	if (fio_is_remote_fd(fd))
-	{
-		fio_header hdr;
-
-		hdr.cop = FIO_FSTAT;
-		hdr.handle = fd & ~FIO_PIPE_MARKER;
-		hdr.size = 0;
-
-		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
-
-		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
-		Assert(hdr.cop == FIO_FSTAT);
-		IO_CHECK(fio_read_all(fio_stdin, st, sizeof(*st)), sizeof(*st));
-
-		if (hdr.arg != 0)
-		{
-			errno = hdr.arg;
-			return -1;
-		}
-		return 0;
-	}
-	else
-	{
-		return fstat(fd, st);
-	}
-}
-
 /* Get information about file */
 int fio_stat(char const* path, struct stat* st, bool follow_symlink, fio_location location)
 {
@@ -830,7 +864,7 @@ int fio_access(char const* path, int mode, fio_location location)
 }
 
 /* Create symbolic link */
-int fio_symlink(char const* target, char const* link_path, fio_location location)
+int fio_symlink(char const* target, char const* link_path, bool overwrite, fio_location location)
 {
 	if (fio_is_remote(location))
 	{
@@ -840,6 +874,7 @@ int fio_symlink(char const* target, char const* link_path, fio_location location
 		hdr.cop = FIO_SYMLINK;
 		hdr.handle = -1;
 		hdr.size = target_len + link_path_len;
+		hdr.arg = overwrite ? 1 : 0;
 
 		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
 		IO_CHECK(fio_write_all(fio_stdout, target, target_len), target_len);
@@ -849,8 +884,24 @@ int fio_symlink(char const* target, char const* link_path, fio_location location
 	}
 	else
 	{
+		if (overwrite)
+			remove_file_or_dir(link_path);
+
 		return symlink(target, link_path);
 	}
+}
+
+static void fio_symlink_impl(int out, char *buf, bool overwrite)
+{
+	char *linked_path = buf;
+	char *link_path = buf + strlen(buf) + 1;
+
+	if (overwrite)
+		remove_file_or_dir(link_path);
+
+	if (symlink(linked_path, link_path))
+		elog(ERROR, "Could not create symbolic link \"%s\": %s",
+			link_path, strerror(errno));
 }
 
 /* Rename file */
@@ -1025,7 +1076,6 @@ int fio_chmod(char const* path, int mode, fio_location location)
 }
 
 #ifdef HAVE_LIBZ
-
 
 #define ZLIB_BUFFER_SIZE     (64*1024)
 #define MAX_WBITS            15 /* 32K LZ77 window */
@@ -1304,8 +1354,10 @@ z_off_t fio_gzseek(gzFile f, z_off_t offset, int whence)
 
 #endif
 
-/* Send file content */
-static void fio_send_file(int out, char const* path)
+/* Send file content
+ * Note: it should not be used for large files.
+ */
+static void fio_load_file(int out, char const* path)
 {
 	int fd = open(path, O_RDONLY);
 	fio_header hdr;
@@ -1335,9 +1387,11 @@ static void fio_send_file(int out, char const* path)
  * Return number of actually(!) readed blocks, attempts or
  * half-readed block are not counted.
  * Return values in case of error:
- *	REMOTE_ERROR
- *	PAGE_CORRUPTION
- *	WRITE_FAILED
+ *  FILE_MISSING
+ *  OPEN_FAILED
+ *  READ_ERROR
+ *  PAGE_CORRUPTION
+ *  WRITE_FAILED
  *
  * If none of the above, this function return number of blocks
  * readed by remote agent.
@@ -1345,11 +1399,13 @@ static void fio_send_file(int out, char const* path)
  * In case of DELTA mode horizonLsn must be a valid lsn,
  * otherwise it should be set to InvalidXLogRecPtr.
  */
-int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
-						   int calg, int clevel, uint32 checksum_version,
-						   datapagemap_t *pagemap, BlockNumber* err_blknum,
-						   char **errormsg)
+int fio_send_pages(const char *to_fullpath, const char *from_fullpath, pgFile *file,
+				   XLogRecPtr horizonLsn, int calg, int clevel, uint32 checksum_version,
+				   bool use_pagemap, BlockNumber* err_blknum, char **errormsg,
+				   BackupPageHeader2 **headers)
 {
+	FILE *out = NULL;
+	char *out_buf = NULL;
 	struct {
 		fio_header hdr;
 		fio_send_request arg;
@@ -1357,23 +1413,20 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 	BlockNumber	n_blocks_read = 0;
 	BlockNumber blknum = 0;
 
-	Assert(fio_is_remote_file(in));
-
 	/* send message with header
 
-	  8bytes       20bytes              var
-	------------------------------------------------------
-	| fio_header | fio_send_request |    BITMAP(if any)  |
-	------------------------------------------------------
+	  8bytes       24bytes             var        var
+	--------------------------------------------------------------
+	| fio_header | fio_send_request | FILE PATH | BITMAP(if any) |
+	--------------------------------------------------------------
 	*/
 
-	req.hdr.handle = fio_fileno(in) & ~FIO_PIPE_MARKER;
+	req.hdr.cop = FIO_SEND_PAGES;
 
-	if (pagemap)
+	if (use_pagemap)
 	{
-		req.hdr.cop = FIO_SEND_PAGES_PAGEMAP;
-		req.hdr.size = sizeof(fio_send_request) + pagemap->bitmapsize;
-		req.arg.bitmapsize = pagemap->bitmapsize;
+		req.hdr.size = sizeof(fio_send_request) + (*file).pagemap.bitmapsize + strlen(from_fullpath) + 1;
+		req.arg.bitmapsize = (*file).pagemap.bitmapsize;
 
 		/* TODO: add optimization for the case of pagemap
 		 * containing small number of blocks with big serial numbers:
@@ -1382,8 +1435,8 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 	}
 	else
 	{
-		req.hdr.cop = FIO_SEND_PAGES;
-		req.hdr.size = sizeof(fio_send_request);
+		req.hdr.size = sizeof(fio_send_request) + strlen(from_fullpath) + 1;
+		req.arg.bitmapsize = 0;
 	}
 
 	req.arg.nblocks = file->size/BLCKSZ;
@@ -1392,6 +1445,7 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 	req.arg.checksumVersion = checksum_version;
 	req.arg.calg = calg;
 	req.arg.clevel = clevel;
+	req.arg.path_len = strlen(from_fullpath) + 1;
 
 	file->compress_alg = calg; /* TODO: wtf? why here? */
 
@@ -1404,11 +1458,15 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 //	pg_free(iter);
 //<-----
 
+	/* send header */
 	IO_CHECK(fio_write_all(fio_stdout, &req, sizeof(req)), sizeof(req));
 
-	if (pagemap)
-		/* now send pagemap itself */
-		IO_CHECK(fio_write_all(fio_stdout, pagemap->bitmap, pagemap->bitmapsize), pagemap->bitmapsize);
+	/* send file path */
+	IO_CHECK(fio_write_all(fio_stdout, from_fullpath, req.arg.path_len), req.arg.path_len);
+
+	/* send pagemap if any */
+	if (use_pagemap)
+		IO_CHECK(fio_write_all(fio_stdout, (*file).pagemap.bitmap, (*file).pagemap.bitmapsize), (*file).pagemap.bitmapsize);
 
 	while (true)
 	{
@@ -1421,9 +1479,15 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 
 		if (hdr.cop == FIO_ERROR)
 		{
-			errno = hdr.arg;
-			*err_blknum = hdr.size;
-			return REMOTE_ERROR;
+			/* FILE_MISSING, OPEN_FAILED and READ_FAILED */
+			if (hdr.size > 0)
+			{
+				IO_CHECK(fio_read_all(fio_stdin, buf, hdr.size), hdr.size);
+				*errormsg = pgut_malloc(hdr.size);
+				snprintf(*errormsg, hdr.size, "%s", buf);
+			}
+
+			return hdr.arg;
 		}
 		else if (hdr.cop == FIO_SEND_FILE_CORRUPTION)
 		{
@@ -1433,14 +1497,23 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 			{
 				IO_CHECK(fio_read_all(fio_stdin, buf, hdr.size), hdr.size);
 				*errormsg = pgut_malloc(hdr.size);
-				strncpy(*errormsg, buf, hdr.size);
+				snprintf(*errormsg, hdr.size, "%s", buf);
 			}
 			return PAGE_CORRUPTION;
 		}
 		else if (hdr.cop == FIO_SEND_FILE_EOF)
 		{
 			/* n_blocks_read reported by EOF */
-			n_blocks_read = hdr.size;
+			n_blocks_read = hdr.arg;
+
+			/* receive headers if any */
+			if (hdr.size > 0)
+			{
+				*headers = pgut_malloc(hdr.size);
+				IO_CHECK(fio_read_all(fio_stdin, *headers, hdr.size), hdr.size);
+				file->n_headers = (hdr.size / sizeof(BackupPageHeader2)) -1;
+			}
+
 			break;
 		}
 		else if (hdr.cop == FIO_PAGE)
@@ -1452,6 +1525,10 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 
 			COMP_FILE_CRC32(true, file->crc, buf, hdr.size);
 
+			/* lazily open backup file */
+			if (!out)
+				out = open_local_file_rw(to_fullpath, &out_buf, STDIO_BUFSIZE);
+
 			if (fio_fwrite(out, buf, hdr.size) != hdr.size)
 			{
 				fio_fclose(out);
@@ -1462,74 +1539,152 @@ int fio_send_pages(FILE* in, FILE* out, pgFile *file, XLogRecPtr horizonLsn,
 			file->uncompressed_size += BLCKSZ;
 		}
 		else
-			elog(ERROR, "Remote agent returned message of unknown type");
+			elog(ERROR, "Remote agent returned message of unexpected type: %i", hdr.cop);
 	}
+
+	if (out)
+		fclose(out);
+	pg_free(out_buf);
 
 	return n_blocks_read;
 }
 
-static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
-{
-	BlockNumber blknum = 0;
-	BlockNumber n_blocks_read = 0;
-	XLogRecPtr	page_lsn = 0;
-	char read_buffer[BLCKSZ+1];
-	fio_header hdr;
-	fio_send_request *req = (fio_send_request*) buf;
+/* TODO: read file using large buffer
+ * Return codes:
+ *  FIO_ERROR:
+ *  	FILE_MISSING (-1)
+ *  	OPEN_FAILED  (-2)
+ *  	READ_FAILED  (-3)
 
+ *  FIO_SEND_FILE_CORRUPTION
+ *  FIO_SEND_FILE_EOF
+ */
+static void fio_send_pages_impl(int out, char* buf)
+{
+	FILE        *in = NULL;
+	BlockNumber  blknum = 0;
+	int          current_pos = 0;
+	BlockNumber  n_blocks_read = 0;
+	PageState    page_st;
+	char         read_buffer[BLCKSZ+1];
+	char         in_buf[STDIO_BUFSIZE];
+	fio_header   hdr;
+	fio_send_request *req = (fio_send_request*) buf;
+	char             *from_fullpath = (char*) buf + sizeof(fio_send_request);
+	bool with_pagemap = req->bitmapsize > 0 ? true : false;
+	/* error reporting */
+	char *errormsg = NULL;
 	/* parse buffer */
 	datapagemap_t *map = NULL;
 	datapagemap_iterator_t *iter = NULL;
+	/* page headers */
+	int32       hdr_num = -1;
+	int32       cur_pos_out = 0;
+	BackupPageHeader2 *headers = NULL;
+
+	/* open source file */
+	in = fopen(from_fullpath, PG_BINARY_R);
+	if (!in)
+	{
+		hdr.cop = FIO_ERROR;
+
+		/* do not send exact wording of ENOENT error message
+		 * because it is a very common error in our case, so
+		 * error code is enough.
+		 */
+		if (errno == ENOENT)
+		{
+			hdr.arg = FILE_MISSING;
+			hdr.size = 0;
+		}
+		else
+		{
+			hdr.arg = OPEN_FAILED;
+			errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+			/* Construct the error message */
+			snprintf(errormsg, ERRMSG_MAX_LEN, "Cannot open file \"%s\": %s",
+					 from_fullpath, strerror(errno));
+			hdr.size = strlen(errormsg) + 1;
+		}
+
+		/* send header and message */
+		IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+		if (errormsg)
+			IO_CHECK(fio_write_all(out, errormsg, hdr.size), hdr.size);
+
+		goto cleanup;
+	}
 
 	if (with_pagemap)
 	{
 		map = pgut_malloc(sizeof(datapagemap_t));
 		map->bitmapsize = req->bitmapsize;
-		map->bitmap = (char*) buf + sizeof(fio_send_request);
+		map->bitmap = (char*) buf + sizeof(fio_send_request) + req->path_len;
 
 		/* get first block */
 		iter = datapagemap_iterate(map);
 		datapagemap_next(iter, &blknum);
-	}
 
-	hdr.cop = FIO_PAGE;
+		setvbuf(in, NULL, _IONBF, BUFSIZ);
+	}
+	else
+		setvbuf(in, in_buf, _IOFBF, STDIO_BUFSIZE);
+
+	/* TODO: what is this barrier for? */
 	read_buffer[BLCKSZ] = 1; /* barrier */
 
 	while (blknum < req->nblocks)
 	{
-		int rc = 0;
-		int retry_attempts = PAGE_READ_ATTEMPTS;
+		int    rc = 0;
+		size_t read_len = 0;
+		int    retry_attempts = PAGE_READ_ATTEMPTS;
 
 		/* TODO: handle signals on the agent */
 		if (interrupted)
 			elog(ERROR, "Interrupted during remote page reading");
 
 		/* read page, check header and validate checksumms */
-		/* TODO: libpq connection on the agent, so we can do ptrack
-		 * magic right here.
-		 */
 		for (;;)
 		{
-			ssize_t read_len = pread(fd, read_buffer, BLCKSZ, blknum*BLCKSZ);
-			page_lsn = InvalidXLogRecPtr;
-
-			/* report eof */
-			if (read_len == 0)
-				goto eof;
-			/* report error */
-			else if (read_len < 0)
+			/*
+			 * Optimize stdio buffer usage, fseek only when current position
+			 * does not match the position of requested block.
+			 */
+			if (current_pos != blknum*BLCKSZ)
 			{
-				/* TODO: better to report exact error message, not errno */
+				current_pos = blknum*BLCKSZ;
+				if (fseek(in, current_pos, SEEK_SET) != 0)
+					elog(ERROR, "fseek to position %u is failed on remote file '%s': %s",
+							current_pos, from_fullpath, strerror(errno));
+			}
+
+			read_len = fread(read_buffer, 1, BLCKSZ, in);
+
+			current_pos += read_len;
+
+			/* report error */
+			if (ferror(in))
+			{
 				hdr.cop = FIO_ERROR;
-				hdr.arg = errno;
-				hdr.size = blknum;
+				hdr.arg = READ_FAILED;
+
+				errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+				/* Construct the error message */
+				snprintf(errormsg, ERRMSG_MAX_LEN, "Cannot read block %u of '%s': %s",
+						blknum, from_fullpath, strerror(errno));
+				hdr.size = strlen(errormsg) + 1;
+
+				/* send header and message */
 				IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+				IO_CHECK(fio_write_all(out, errormsg, hdr.size), hdr.size);
 				goto cleanup;
 			}
-			else if (read_len == BLCKSZ)
+
+			if (read_len == BLCKSZ)
 			{
 				rc = validate_one_page(read_buffer, req->segmentno + blknum,
-										   InvalidXLogRecPtr, &page_lsn, req->checksumVersion);
+										   InvalidXLogRecPtr, &page_st,
+										   req->checksumVersion);
 
 				/* TODO: optimize copy of zeroed page */
 				if (rc == PAGE_IS_ZEROED)
@@ -1537,6 +1692,9 @@ static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
 				else if (rc == PAGE_IS_VALID)
 					break;
 			}
+
+			if (feof(in))
+				goto eof;
 //		  	else /* readed less than BLKSZ bytes, retry */
 
 			/* File is either has insane header or invalid checksum,
@@ -1544,7 +1702,6 @@ static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
 			 */
 			if (--retry_attempts == 0)
 			{
-				char *errormsg = NULL;
 				hdr.cop = FIO_SEND_FILE_CORRUPTION;
 				hdr.arg = blknum;
 
@@ -1565,7 +1722,6 @@ static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
 				if (errormsg)
 					IO_CHECK(fio_write_all(out, errormsg, hdr.size), hdr.size);
 
-				pg_free(errormsg);
 				goto cleanup;
 			}
 		}
@@ -1577,32 +1733,50 @@ static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
 		 * As far as unsigned number are always greater or equal than zero,
 		 * there is no sense to add more checks.
 		 */
-		if ((req->horizonLsn == InvalidXLogRecPtr) ||
-			(page_lsn == InvalidXLogRecPtr) ||                     /* zeroed page */
-			(req->horizonLsn > 0 && page_lsn >= req->horizonLsn))  /* delta */
+		if ((req->horizonLsn == InvalidXLogRecPtr) ||                 /* full, page, ptrack */
+			(page_st.lsn == InvalidXLogRecPtr) ||                     /* zeroed page */
+			(req->horizonLsn > 0 && page_st.lsn > req->horizonLsn))   /* delta */
 		{
+			int  compressed_size = 0;
 			char write_buffer[BLCKSZ*2];
 			BackupPageHeader* bph = (BackupPageHeader*)write_buffer;
 
 			/* compress page */
-			hdr.arg = bph->block = blknum;
-			hdr.size = sizeof(BackupPageHeader);
+			hdr.cop = FIO_PAGE;
+			hdr.arg = blknum;
 
-			bph->compressed_size = do_compress(write_buffer + sizeof(BackupPageHeader),
-											   sizeof(write_buffer) - sizeof(BackupPageHeader),
-											   read_buffer, BLCKSZ, req->calg, req->clevel,
-											   NULL);
+			compressed_size = do_compress(write_buffer + sizeof(BackupPageHeader),
+										  sizeof(write_buffer) - sizeof(BackupPageHeader),
+										  read_buffer, BLCKSZ, req->calg, req->clevel,
+										  NULL);
 
-			if (bph->compressed_size <= 0 || bph->compressed_size >= BLCKSZ)
+			if (compressed_size <= 0 || compressed_size >= BLCKSZ)
 			{
 				/* Do not compress page */
 				memcpy(write_buffer + sizeof(BackupPageHeader), read_buffer, BLCKSZ);
-				bph->compressed_size = BLCKSZ;
+				compressed_size = BLCKSZ;
 			}
-			hdr.size += MAXALIGN(bph->compressed_size);
+			bph->block = blknum;
+			bph->compressed_size = compressed_size;
+
+			hdr.size = compressed_size + sizeof(BackupPageHeader);
 
 			IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
 			IO_CHECK(fio_write_all(out, write_buffer, hdr.size), hdr.size);
+
+			/* set page header for this file */
+			hdr_num++;
+			if (!headers)
+				headers = (BackupPageHeader2 *) pgut_malloc(sizeof(BackupPageHeader2));
+			else
+				headers = (BackupPageHeader2 *) pgut_realloc(headers, (hdr_num+1) * sizeof(BackupPageHeader2));
+
+			headers[hdr_num].block = blknum;
+			headers[hdr_num].lsn = page_st.lsn;
+			headers[hdr_num].checksum = page_st.checksum;
+			headers[hdr_num].pos = cur_pos_out;
+
+			cur_pos_out += hdr.size;
 		}
 
 		/* next block */
@@ -1619,14 +1793,734 @@ static void fio_send_pages_impl(int fd, int out, char* buf, bool with_pagemap)
 eof:
 	/* We are done, send eof */
 	hdr.cop = FIO_SEND_FILE_EOF;
-	hdr.arg = 0;
-	hdr.size = n_blocks_read; /* TODO: report number of backed up blocks */
+	hdr.arg = n_blocks_read;
+	hdr.size = 0;
+
+	if (headers)
+	{
+		hdr.size = (hdr_num+2) * sizeof(BackupPageHeader2);
+
+		/* add dummy header */
+		headers = (BackupPageHeader2 *) pgut_realloc(headers, (hdr_num+2) * sizeof(BackupPageHeader2));
+		headers[hdr_num+1].pos = cur_pos_out;
+	}
 	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+
+	if (headers)
+		IO_CHECK(fio_write_all(out, headers, hdr.size), hdr.size);
 
 cleanup:
 	pg_free(map);
 	pg_free(iter);
+	pg_free(errormsg);
+	pg_free(headers);
+	if (in)
+		fclose(in);
 	return;
+}
+
+/* Receive chunks of compressed data, decompress them and write to
+ * destination file.
+ * Return codes:
+ *   FILE_MISSING (-1)
+ *   OPEN_FAILED  (-2)
+ *   READ_FAILED  (-3)
+ *   WRITE_FAILED (-4)
+ *   ZLIB_ERROR   (-5)
+ *   REMOTE_ERROR (-6)
+ */
+int fio_send_file_gz(const char *from_fullpath, const char *to_fullpath, FILE* out, char **errormsg)
+{
+	fio_header hdr;
+	int exit_code = SEND_OK;
+	char *in_buf = pgut_malloc(CHUNK_SIZE);    /* buffer for compressed data */
+	char *out_buf = pgut_malloc(OUT_BUF_SIZE); /* 1MB buffer for decompressed data */
+	size_t path_len = strlen(from_fullpath) + 1;
+	/* decompressor */
+	z_stream *strm = NULL;
+
+	hdr.cop = FIO_SEND_FILE;
+	hdr.size = path_len;
+
+//	elog(VERBOSE, "Thread [%d]: Attempting to open remote compressed WAL file '%s'",
+//			thread_num, from_fullpath);
+
+	IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+	IO_CHECK(fio_write_all(fio_stdout, from_fullpath, path_len), path_len);
+
+	for (;;)
+	{
+		fio_header hdr;
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+		if (hdr.cop == FIO_SEND_FILE_EOF)
+		{
+			break;
+		}
+		else if (hdr.cop == FIO_ERROR)
+		{
+			/* handle error, reported by the agent */
+			if (hdr.size > 0)
+			{
+				IO_CHECK(fio_read_all(fio_stdin, in_buf, hdr.size), hdr.size);
+				*errormsg = pgut_malloc(hdr.size);
+				snprintf(*errormsg, hdr.size, "%s", in_buf);
+			}
+			exit_code = hdr.arg;
+			goto cleanup;
+		}
+		else if (hdr.cop == FIO_PAGE)
+		{
+			int rc;
+			Assert(hdr.size <= CHUNK_SIZE);
+			IO_CHECK(fio_read_all(fio_stdin, in_buf, hdr.size), hdr.size);
+
+			/* We have received a chunk of compressed data, lets decompress it */
+			if (strm == NULL)
+			{
+				/* Initialize decompressor */
+				strm = pgut_malloc(sizeof(z_stream));
+				memset(strm, 0, sizeof(z_stream));
+
+				/* The fields next_in, avail_in initialized before init */
+				strm->next_in = (Bytef *)in_buf;
+				strm->avail_in = hdr.size;
+
+				rc = inflateInit2(strm, 15 + 16);
+
+				if (rc != Z_OK)
+				{
+					*errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+					snprintf(*errormsg, ERRMSG_MAX_LEN,
+							"Failed to initialize decompression stream for file '%s': %i: %s",
+							from_fullpath, rc, strm->msg);
+					exit_code = ZLIB_ERROR;
+					goto cleanup;
+				}
+			}
+			else
+			{
+				strm->next_in = (Bytef *)in_buf;
+				strm->avail_in = hdr.size;
+			}
+
+			strm->next_out = (Bytef *)out_buf; /* output buffer */
+			strm->avail_out = OUT_BUF_SIZE; /* free space in output buffer */
+
+			/*
+			 * From zlib documentation:
+			 * The application must update next_in and avail_in when avail_in
+			 * has dropped to zero. It must update next_out and avail_out when
+			 * avail_out has dropped to zero.
+			 */
+			while (strm->avail_in != 0) /* while there is data in input buffer, decompress it */
+			{
+				/* decompress until there is no data to decompress,
+				 * or buffer with uncompressed data is full
+				 */
+				rc = inflate(strm, Z_NO_FLUSH);
+				if (rc == Z_STREAM_END)
+					/* end of stream */
+					break;
+				else if (rc != Z_OK)
+				{
+					/* got an error */
+					*errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+					snprintf(*errormsg, ERRMSG_MAX_LEN,
+							"Decompression failed for file '%s': %i: %s",
+							from_fullpath, rc, strm->msg);
+					exit_code = ZLIB_ERROR;
+					goto cleanup;
+				}
+
+				if (strm->avail_out == 0)
+				{
+					/* Output buffer is full, write it out */
+					if (fwrite(out_buf, 1, OUT_BUF_SIZE, out) != OUT_BUF_SIZE)
+					{
+						exit_code = WRITE_FAILED;
+						goto cleanup;
+					}
+
+					strm->next_out = (Bytef *)out_buf; /* output buffer */
+					strm->avail_out = OUT_BUF_SIZE;
+				}
+			}
+
+			/* write out leftovers if any */
+			if (strm->avail_out != OUT_BUF_SIZE)
+			{
+				int len = OUT_BUF_SIZE - strm->avail_out;
+
+				if (fwrite(out_buf, 1, len, out) != len)
+				{
+					exit_code = WRITE_FAILED;
+					goto cleanup;
+				}
+			}
+		}
+		else
+			elog(ERROR, "Remote agent returned message of unexpected type: %i", hdr.cop);
+	}
+
+cleanup:
+	if (exit_code < OPEN_FAILED)
+		fio_disconnect(); /* discard possible pending data in pipe */
+
+	if (strm)
+	{
+		inflateEnd(strm);
+		pg_free(strm);
+	}
+
+	pg_free(in_buf);
+	pg_free(out_buf);
+	return exit_code;
+}
+
+/* Receive chunks of data and write them to destination file.
+ * Return codes:
+ *   SEND_OK       (0)
+ *   FILE_MISSING (-1)
+ *   OPEN_FAILED  (-2)
+ *   READ_FAILED  (-3)
+ *   WRITE_FAILED (-4)
+ *
+ * OPEN_FAILED and READ_FAIL should also set errormsg.
+ * If pgFile is not NULL then we must calculate crc and read_size for it.
+ */
+int fio_send_file(const char *from_fullpath, const char *to_fullpath, FILE* out,
+												pgFile *file, char **errormsg)
+{
+	fio_header hdr;
+	int exit_code = SEND_OK;
+	size_t path_len = strlen(from_fullpath) + 1;
+	char *buf = pgut_malloc(CHUNK_SIZE);    /* buffer */
+
+	hdr.cop = FIO_SEND_FILE;
+	hdr.size = path_len;
+
+//	elog(VERBOSE, "Thread [%d]: Attempting to open remote WAL file '%s'",
+//			thread_num, from_fullpath);
+
+	IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+	IO_CHECK(fio_write_all(fio_stdout, from_fullpath, path_len), path_len);
+
+	for (;;)
+	{
+		/* receive data */
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+		if (hdr.cop == FIO_SEND_FILE_EOF)
+		{
+			break;
+		}
+		else if (hdr.cop == FIO_ERROR)
+		{
+			/* handle error, reported by the agent */
+			if (hdr.size > 0)
+			{
+				IO_CHECK(fio_read_all(fio_stdin, buf, hdr.size), hdr.size);
+				*errormsg = pgut_malloc(hdr.size);
+				snprintf(*errormsg, hdr.size, "%s", buf);
+			}
+			exit_code = hdr.arg;
+			break;
+		}
+		else if (hdr.cop == FIO_PAGE)
+		{
+			Assert(hdr.size <= CHUNK_SIZE);
+			IO_CHECK(fio_read_all(fio_stdin, buf, hdr.size), hdr.size);
+
+			/* We have received a chunk of data data, lets write it out */
+			if (fwrite(buf, 1, hdr.size, out) != hdr.size)
+			{
+				exit_code = WRITE_FAILED;
+				break;
+			}
+
+			if (file)
+			{
+				file->read_size += hdr.size;
+				COMP_FILE_CRC32(true, file->crc, buf, hdr.size);
+			}
+		}
+		else
+		{
+			/* TODO: fio_disconnect may get assert fail when running after this */
+			elog(ERROR, "Remote agent returned message of unexpected type: %i", hdr.cop);
+		}
+	}
+
+	if (exit_code < OPEN_FAILED)
+		fio_disconnect(); /* discard possible pending data in pipe */
+
+	pg_free(buf);
+	return exit_code;
+}
+
+/* Send file content
+ * On error we return FIO_ERROR message with following codes
+ *  FIO_ERROR:
+ *      FILE_MISSING (-1)
+ *      OPEN_FAILED  (-2)
+ *      READ_FAILED  (-3)
+ *
+ *  FIO_PAGE
+ *  FIO_SEND_FILE_EOF
+ *
+ */
+static void fio_send_file_impl(int out, char const* path)
+{
+	FILE      *fp;
+	fio_header hdr;
+	char      *buf = pgut_malloc(CHUNK_SIZE);
+	size_t	   read_len = 0;
+	char      *errormsg = NULL;
+
+	/* open source file for read */
+	/* TODO: check that file is regular file */
+	fp = fopen(path, PG_BINARY_R);
+	if (!fp)
+	{
+		hdr.cop = FIO_ERROR;
+
+		/* do not send exact wording of ENOENT error message
+		 * because it is a very common error in our case, so
+		 * error code is enough.
+		 */
+		if (errno == ENOENT)
+		{
+			hdr.arg = FILE_MISSING;
+			hdr.size = 0;
+		}
+		else
+		{
+			hdr.arg = OPEN_FAILED;
+			errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+			/* Construct the error message */
+			snprintf(errormsg, ERRMSG_MAX_LEN, "Cannot open file '%s': %s", path, strerror(errno));
+			hdr.size = strlen(errormsg) + 1;
+		}
+
+		/* send header and message */
+		IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+		if (errormsg)
+			IO_CHECK(fio_write_all(out, errormsg, hdr.size), hdr.size);
+
+		goto cleanup;
+	}
+
+	/* disable stdio buffering */
+	setvbuf(fp, NULL, _IONBF, BUFSIZ);
+
+	/* copy content */
+	for (;;)
+	{
+		read_len = fread(buf, 1, CHUNK_SIZE, fp);
+
+		/* report error */
+		if (ferror(fp))
+		{
+			hdr.cop = FIO_ERROR;
+			errormsg = pgut_malloc(ERRMSG_MAX_LEN);
+			hdr.arg = READ_FAILED;
+			/* Construct the error message */
+			snprintf(errormsg, ERRMSG_MAX_LEN, "Cannot read from file '%s': %s", path, strerror(errno));
+			hdr.size = strlen(errormsg) + 1;
+			/* send header and message */
+			IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+			IO_CHECK(fio_write_all(out, errormsg, hdr.size), hdr.size);
+
+			goto cleanup;
+		}
+
+		if (read_len > 0)
+		{
+			/* send chunk */
+			hdr.cop = FIO_PAGE;
+			hdr.size = read_len;
+			IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+			IO_CHECK(fio_write_all(out, buf, read_len), read_len);
+		}
+
+		if (feof(fp))
+			break;
+	}
+
+	/* we are done, send eof */
+	hdr.cop = FIO_SEND_FILE_EOF;
+	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+
+cleanup:
+	if (fp)
+		fclose(fp);
+	pg_free(buf);
+	pg_free(errormsg);
+	return;
+}
+
+/* Compile the array of files located on remote machine in directory root */
+void fio_list_dir(parray *files, const char *root, bool exclude,
+				  bool follow_symlink, bool add_root, bool backup_logs,
+				  bool skip_hidden, int external_dir_num)
+{
+	fio_header hdr;
+	fio_list_dir_request req;
+	char *buf = pgut_malloc(CHUNK_SIZE);
+
+	/* Send to the agent message with parameters for directory listing */
+	snprintf(req.path, MAXPGPATH, "%s", root);
+	req.exclude = exclude;
+	req.follow_symlink = follow_symlink;
+	req.add_root = add_root;
+	req.backup_logs = backup_logs;
+	req.exclusive_backup = exclusive_backup;
+	req.skip_hidden = skip_hidden;
+	req.external_dir_num = external_dir_num;
+
+	hdr.cop = FIO_LIST_DIR;
+	hdr.size = sizeof(req);
+
+	IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+	IO_CHECK(fio_write_all(fio_stdout, &req, hdr.size), hdr.size);
+
+	for (;;)
+	{
+		/* receive data */
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+		if (hdr.cop == FIO_SEND_FILE_EOF)
+		{
+			/* the work is done */
+			break;
+		}
+		else if (hdr.cop == FIO_SEND_FILE)
+		{
+			pgFile *file = NULL;
+			fio_pgFile  fio_file;
+
+			/* receive rel_path */
+			IO_CHECK(fio_read_all(fio_stdin, buf, hdr.size), hdr.size);
+			file = pgFileInit(buf);
+
+			/* receive metainformation */
+			IO_CHECK(fio_read_all(fio_stdin, &fio_file, sizeof(fio_file)), sizeof(fio_file));
+
+			file->mode = fio_file.mode;
+			file->size = fio_file.size;
+			file->mtime = fio_file.mtime;
+			file->is_datafile = fio_file.is_datafile;
+			file->is_database = fio_file.is_database;
+			file->tblspcOid = fio_file.tblspcOid;
+			file->dbOid = fio_file.dbOid;
+			file->relOid = fio_file.relOid;
+			file->forkName = fio_file.forkName;
+			file->segno = fio_file.segno;
+			file->external_dir_num = fio_file.external_dir_num;
+
+			if (fio_file.linked_len > 0)
+			{
+				IO_CHECK(fio_read_all(fio_stdin, buf, fio_file.linked_len), fio_file.linked_len);
+
+				file->linked = pgut_malloc(fio_file.linked_len);
+				snprintf(file->linked, fio_file.linked_len, "%s", buf);
+			}
+
+//			elog(INFO, "Received file: %s, mode: %u, size: %lu, mtime: %lu",
+//				file->rel_path, file->mode, file->size, file->mtime);
+
+			parray_append(files, file);
+		}
+		else
+		{
+			/* TODO: fio_disconnect may get assert fail when running after this */
+			elog(ERROR, "Remote agent returned message of unexpected type: %i", hdr.cop);
+		}
+	}
+
+	pg_free(buf);
+}
+
+
+/*
+ * To get the arrays of files we use the same function dir_list_file(),
+ * that is used for local backup.
+ * After that we iterate over arrays and for every file send at least
+ * two messages to main process:
+ * 1. rel_path
+ * 2. metainformation (size, mtime, etc)
+ * 3. link path (optional)
+ *
+ * TODO: replace FIO_SEND_FILE and FIO_SEND_FILE_EOF with dedicated messages
+ */
+static void fio_list_dir_impl(int out, char* buf)
+{
+	int i;
+	fio_header hdr;
+	fio_list_dir_request *req = (fio_list_dir_request*) buf;
+	parray *file_files = parray_new();
+
+	/*
+	 * Disable logging into console any messages with exception of ERROR messages,
+	 * because currently we have no mechanism to notify the main process
+	 * about then message been sent.
+	 * TODO: correctly send elog messages from agent to main process.
+	 */
+	instance_config.logger.log_level_console = ERROR;
+	exclusive_backup = req->exclusive_backup;
+
+	dir_list_file(file_files, req->path, req->exclude, req->follow_symlink,
+				  req->add_root, req->backup_logs, req->skip_hidden,
+				  req->external_dir_num, FIO_LOCAL_HOST);
+
+	/* send information about files to the main process */
+	for (i = 0; i < parray_num(file_files); i++)
+	{
+		fio_pgFile  fio_file;
+		pgFile	   *file = (pgFile *) parray_get(file_files, i);
+
+		fio_file.mode = file->mode;
+		fio_file.size = file->size;
+		fio_file.mtime = file->mtime;
+		fio_file.is_datafile = file->is_datafile;
+		fio_file.is_database = file->is_database;
+		fio_file.tblspcOid = file->tblspcOid;
+		fio_file.dbOid = file->dbOid;
+		fio_file.relOid = file->relOid;
+		fio_file.forkName = file->forkName;
+		fio_file.segno = file->segno;
+		fio_file.external_dir_num = file->external_dir_num;
+
+		if (file->linked)
+			fio_file.linked_len = strlen(file->linked) + 1;
+		else
+			fio_file.linked_len = 0;
+
+		hdr.cop = FIO_SEND_FILE;
+		hdr.size = strlen(file->rel_path) + 1;
+
+		/* send rel_path first */
+		IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+		IO_CHECK(fio_write_all(out, file->rel_path, hdr.size), hdr.size);
+
+		/* now send file metainformation */
+		IO_CHECK(fio_write_all(out, &fio_file, sizeof(fio_file)), sizeof(fio_file));
+
+		/* If file is a symlink, then send link path */
+		if (file->linked)
+			IO_CHECK(fio_write_all(out, file->linked, fio_file.linked_len), fio_file.linked_len);
+
+		pgFileFree(file);
+	}
+
+	parray_free(file_files);
+	hdr.cop = FIO_SEND_FILE_EOF;
+	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+}
+
+PageState *
+fio_get_checksum_map(const char *fullpath, uint32 checksum_version, int n_blocks,
+					 XLogRecPtr dest_stop_lsn, BlockNumber segmentno, fio_location location)
+{
+	if (fio_is_remote(location))
+	{
+		fio_header hdr;
+		fio_checksum_map_request req_hdr;
+		PageState *checksum_map = NULL;
+		size_t path_len = strlen(fullpath) + 1;
+
+		req_hdr.n_blocks = n_blocks;
+		req_hdr.segmentno = segmentno;
+		req_hdr.stop_lsn = dest_stop_lsn;
+		req_hdr.checksumVersion = checksum_version;
+
+		hdr.cop = FIO_GET_CHECKSUM_MAP;
+		hdr.size = sizeof(req_hdr) + path_len;
+
+		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+		IO_CHECK(fio_write_all(fio_stdout, &req_hdr, sizeof(req_hdr)), sizeof(req_hdr));
+		IO_CHECK(fio_write_all(fio_stdout, fullpath, path_len), path_len);
+
+		/* receive data */
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+		if (hdr.size > 0)
+		{
+			checksum_map = pgut_malloc(n_blocks * sizeof(PageState));
+			memset(checksum_map, 0, n_blocks * sizeof(PageState));
+			IO_CHECK(fio_read_all(fio_stdin, checksum_map, hdr.size * sizeof(PageState)), hdr.size * sizeof(PageState));
+		}
+
+		return checksum_map;
+	}
+	else
+	{
+
+		return get_checksum_map(fullpath, checksum_version,
+								n_blocks, dest_stop_lsn, segmentno);
+	}
+}
+
+static void fio_get_checksum_map_impl(int out, char *buf)
+{
+	fio_header  hdr;
+	PageState  *checksum_map = NULL;
+	char       *fullpath = (char*) buf + sizeof(fio_checksum_map_request);
+	fio_checksum_map_request *req = (fio_checksum_map_request*) buf;
+
+	checksum_map = get_checksum_map(fullpath, req->checksumVersion,
+									req->n_blocks, req->stop_lsn, req->segmentno);
+	hdr.size = req->n_blocks;
+
+	/* send array of PageState`s to main process */
+	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+	if (hdr.size > 0)
+		IO_CHECK(fio_write_all(out, checksum_map, hdr.size * sizeof(PageState)), hdr.size * sizeof(PageState));
+
+	pg_free(checksum_map);
+}
+
+datapagemap_t *
+fio_get_lsn_map(const char *fullpath, uint32 checksum_version,
+				int n_blocks, XLogRecPtr shift_lsn, BlockNumber segmentno,
+				fio_location location)
+{
+	datapagemap_t* lsn_map = NULL;
+
+	if (fio_is_remote(location))
+	{
+		fio_header hdr;
+		fio_lsn_map_request req_hdr;
+		size_t path_len = strlen(fullpath) + 1;
+
+		req_hdr.n_blocks = n_blocks;
+		req_hdr.segmentno = segmentno;
+		req_hdr.shift_lsn = shift_lsn;
+		req_hdr.checksumVersion = checksum_version;
+
+		hdr.cop = FIO_GET_LSN_MAP;
+		hdr.size = sizeof(req_hdr) + path_len;
+
+		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+		IO_CHECK(fio_write_all(fio_stdout, &req_hdr, sizeof(req_hdr)), sizeof(req_hdr));
+		IO_CHECK(fio_write_all(fio_stdout, fullpath, path_len), path_len);
+
+		/* receive data */
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+
+		if (hdr.size > 0)
+		{
+			lsn_map = pgut_malloc(sizeof(datapagemap_t));
+			memset(lsn_map, 0, sizeof(datapagemap_t));
+
+			lsn_map->bitmap = pgut_malloc(hdr.size);
+			lsn_map->bitmapsize = hdr.size;
+
+			IO_CHECK(fio_read_all(fio_stdin, lsn_map->bitmap, hdr.size), hdr.size);
+		}
+	}
+	else
+	{
+		lsn_map = get_lsn_map(fullpath, checksum_version, n_blocks,
+							  shift_lsn, segmentno);
+	}
+
+	return lsn_map;
+}
+
+static void fio_get_lsn_map_impl(int out, char *buf)
+{
+	fio_header     hdr;
+	datapagemap_t *lsn_map = NULL;
+	char          *fullpath = (char*) buf + sizeof(fio_lsn_map_request);
+	fio_lsn_map_request *req = (fio_lsn_map_request*) buf;
+
+	lsn_map = get_lsn_map(fullpath, req->checksumVersion, req->n_blocks,
+						  req->shift_lsn, req->segmentno);
+	if (lsn_map)
+		hdr.size = lsn_map->bitmapsize;
+	else
+		hdr.size = 0;
+
+	/* send bitmap to main process */
+	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+	if (hdr.size > 0)
+		IO_CHECK(fio_write_all(out, lsn_map->bitmap, hdr.size), hdr.size);
+
+	if (lsn_map)
+	{
+		pg_free(lsn_map->bitmap);
+		pg_free(lsn_map);
+	}
+}
+
+/*
+ * Go to the remote host and get postmaster pid from file postmaster.pid
+ * and check that process is running, if process is running, return its pid number.
+ */
+pid_t fio_check_postmaster(const char *pgdata, fio_location location)
+{
+	if (fio_is_remote(location))
+	{
+		fio_header hdr;
+
+		hdr.cop = FIO_CHECK_POSTMASTER;
+		hdr.size = strlen(pgdata) + 1;
+
+		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+		IO_CHECK(fio_write_all(fio_stdout, pgdata, hdr.size), hdr.size);
+
+		/* receive result */
+		IO_CHECK(fio_read_all(fio_stdin, &hdr, sizeof(hdr)), sizeof(hdr));
+		return hdr.arg;
+	}
+	else
+		return check_postmaster(pgdata);
+}
+
+static void fio_check_postmaster_impl(int out, char *buf)
+{
+	fio_header  hdr;
+	pid_t       postmaster_pid;
+	char       *pgdata = (char*) buf;
+
+	postmaster_pid = check_postmaster(pgdata);
+
+	/* send arrays of checksums to main process */
+	hdr.arg = postmaster_pid;
+	IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
+}
+
+/*
+ * Delete file pointed by the pgFile.
+ * If the pgFile points directory, the directory must be empty.
+ */
+void
+fio_delete(mode_t mode, const char *fullpath, fio_location location)
+{
+	if (fio_is_remote(location))
+	{
+		fio_header  hdr;
+
+		hdr.cop = FIO_DELETE;
+		hdr.size = strlen(fullpath) + 1;
+		hdr.arg = mode;
+
+		IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
+		IO_CHECK(fio_write_all(fio_stdout, fullpath, hdr.size), hdr.size);
+
+	}
+	else
+		pgFileDelete(mode, fullpath);
+}
+
+static void
+fio_delete_impl(mode_t mode, char *buf)
+{
+	char  *fullpath = (char*) buf;
+
+	pgFileDelete(mode, fullpath);
 }
 
 /* Execute commands at remote host */
@@ -1665,7 +2559,7 @@ void fio_communicate(int in, int out)
 		}
 		switch (hdr.cop) {
 		  case FIO_LOAD: /* Send file content */
-			fio_send_file(out, buf);
+			fio_load_file(out, buf);
 			break;
 		  case FIO_OPENDIR: /* Open directory for traversal */
 			dir[hdr.handle] = opendir(buf);
@@ -1727,11 +2621,9 @@ void fio_communicate(int in, int out)
 			if (hdr.size != 0)
 				IO_CHECK(fio_write_all(out, buf, hdr.size),  hdr.size);
 			break;
-		  case FIO_FSTAT: /* Get information about opened file */
-			hdr.size = sizeof(st);
-			hdr.arg = fstat(fd[hdr.handle], &st) < 0 ? errno : 0;
+		  case FIO_AGENT_VERSION:
+			hdr.arg = AGENT_PROTOCOL_VERSION;
 			IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
-			IO_CHECK(fio_write_all(out, &st, sizeof(st)), sizeof(st));
 			break;
 		  case FIO_STAT: /* Get information about file with specified path */
 			hdr.size = sizeof(st);
@@ -1749,7 +2641,7 @@ void fio_communicate(int in, int out)
 			SYS_CHECK(rename(buf, buf + strlen(buf) + 1));
 			break;
 		  case FIO_SYMLINK: /* Create symbolic link */
-			SYS_CHECK(symlink(buf, buf + strlen(buf) + 1));
+			fio_symlink_impl(out, buf, hdr.arg > 0 ? true : false);
 			break;
 		  case FIO_UNLINK: /* Remove file or directory (TODO: Win32) */
 			SYS_CHECK(remove_file_or_dir(buf));
@@ -1768,13 +2660,15 @@ void fio_communicate(int in, int out)
 		  case FIO_TRUNCATE: /* Truncate file */
 			SYS_CHECK(ftruncate(fd[hdr.handle], hdr.arg));
 			break;
-		  case FIO_SEND_PAGES:
-			Assert(hdr.size == sizeof(fio_send_request));
-			fio_send_pages_impl(fd[hdr.handle], out, buf, false);
+		  case FIO_LIST_DIR:
+			fio_list_dir_impl(out, buf);
 			break;
-		  case FIO_SEND_PAGES_PAGEMAP:
+		  case FIO_SEND_PAGES:
 			// buf contain fio_send_request header and bitmap.
-			fio_send_pages_impl(fd[hdr.handle], out, buf, true);
+			fio_send_pages_impl(out, buf);
+			break;
+		  case FIO_SEND_FILE:
+			fio_send_file_impl(out, buf);
 			break;
 		  case FIO_SYNC:
 			/* open file and fsync it */
@@ -1799,6 +2693,22 @@ void fio_communicate(int in, int out)
 			else
 				crc = pgFileGetCRC(buf, true, true);
 			IO_CHECK(fio_write_all(out, &crc, sizeof(crc)), sizeof(crc));
+			break;
+		  case FIO_GET_CHECKSUM_MAP:
+			/* calculate crc32 for a file */
+			fio_get_checksum_map_impl(out, buf);
+			break;
+		  case FIO_GET_LSN_MAP:
+			/* calculate crc32 for a file */
+			fio_get_lsn_map_impl(out, buf);
+			break;
+		  case FIO_CHECK_POSTMASTER:
+			/* calculate crc32 for a file */
+			fio_check_postmaster_impl(out, buf);
+			break;
+		  case FIO_DELETE:
+			/* delete file */
+			fio_delete_impl(hdr.arg, buf);
 			break;
 		  case FIO_DISCONNECT:
 			hdr.cop = FIO_DISCONNECTED;

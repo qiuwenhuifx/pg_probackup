@@ -246,6 +246,18 @@ class ProbackupTest(object):
             print('pg_probackup binary is not found')
             exit(1)
 
+        self.probackup_version = None
+
+        try:
+            self.probackup_version_output = subprocess.check_output(
+                [self.probackup_path, "--version"],
+                stderr=subprocess.STDOUT,
+                ).decode('utf-8')
+        except subprocess.CalledProcessError as e:
+            raise ProbackupException(e.output.decode('utf-8'))
+
+        self.probackup_version = re.search(r"\d+\.\d+\.\d+", self.probackup_version_output).group(0)
+
         if os.name == 'posix':
             self.EXTERNAL_DIRECTORY_DELIMITER = ':'
             os.environ['PATH'] = os.path.dirname(
@@ -328,7 +340,8 @@ class ProbackupTest(object):
 
         # set major version
         with open(os.path.join(node.data_dir, 'PG_VERSION')) as f:
-            node.major_version = str(f.read().rstrip())
+            node.major_version_str = str(f.read().rstrip())
+            node.major_version = float(node.major_version_str)
 
         # Sane default parameters
         options = {}
@@ -339,12 +352,13 @@ class ProbackupTest(object):
         options['wal_level'] = 'logical'
         options['hot_standby'] = 'off'
 
-        options['log_line_prefix'] = '"%t [%p]: [%l-1] "'
+        options['log_line_prefix'] = '%t [%p]: [%l-1] '
         options['log_statement'] = 'none'
         options['log_duration'] = 'on'
         options['log_min_duration_statement'] = 0
         options['log_connections'] = 'on'
         options['log_disconnections'] = 'on'
+        options['restart_after_crash'] = 'off'
 
         # Allow replication in pg_hba.conf
         if set_replication:
@@ -352,7 +366,8 @@ class ProbackupTest(object):
 
         if ptrack_enable:
             if node.major_version > 11:
-                options['ptrack_map_size'] = '128MB'
+                options['ptrack.map_size'] = '128'
+                options['shared_preload_libraries'] = 'ptrack'
             else:
                 options['ptrack_enable'] = 'on'
 
@@ -870,7 +885,8 @@ class ProbackupTest(object):
 
     def restore_node(
             self, backup_dir, instance, node=False,
-            data_dir=None, backup_id=None, old_binary=False, options=[]
+            data_dir=None, backup_id=None, old_binary=False, options=[],
+            gdb=False
             ):
 
         if data_dir is None:
@@ -895,7 +911,7 @@ class ProbackupTest(object):
         if not old_binary:
             cmd_list += ['--no-sync']
 
-        return self.run_pb(cmd_list + options, old_binary=old_binary)
+        return self.run_pb(cmd_list + options, gdb=gdb, old_binary=old_binary)
 
     def show_pb(
             self, backup_dir, instance=None, backup_id=None,
@@ -1131,7 +1147,7 @@ class ProbackupTest(object):
 
     def set_archiving(
             self, backup_dir, instance, node, replica=False,
-            overwrite=False, compress=False, old_binary=False,
+            overwrite=False, compress=True, old_binary=False,
             log_level=False, archive_timeout=False):
 
         # parse postgresql.auto.conf
@@ -1156,13 +1172,13 @@ class ProbackupTest(object):
             options['archive_command'] += '--remote-proto=ssh '
             options['archive_command'] += '--remote-host=localhost '
 
-        if self.archive_compress or compress:
+        if self.archive_compress and compress:
             options['archive_command'] += '--compress '
 
         if overwrite:
             options['archive_command'] += '--overwrite '
 
-        options['archive_command'] += '--log-level-console=verbose '
+        options['archive_command'] += '--log-level-console=VERBOSE '
         options['archive_command'] += '-j 5 '
         options['archive_command'] += '--batch-size 10 '
         options['archive_command'] += '--no-sync '
@@ -1259,7 +1275,8 @@ class ProbackupTest(object):
     def set_replica(
             self, master, replica,
             replica_name='replica',
-            synchronous=False
+            synchronous=False,
+            log_shipping=False
             ):
 
         self.set_auto_conf(
@@ -1279,19 +1296,22 @@ class ProbackupTest(object):
                 if os.stat(probackup_recovery_path).st_size > 0:
                     config = 'probackup_recovery.conf'
 
-            self.set_auto_conf(
-                replica,
-                {'primary_conninfo': 'user={0} port={1} application_name={2} '
-                ' sslmode=prefer sslcompression=1'.format(
-                    self.user, master.port, replica_name)},
-                config)
+            if not log_shipping:
+                self.set_auto_conf(
+                    replica,
+                    {'primary_conninfo': 'user={0} port={1} application_name={2} '
+                    ' sslmode=prefer sslcompression=1'.format(
+                        self.user, master.port, replica_name)},
+                    config)
         else:
             replica.append_conf('recovery.conf', 'standby_mode = on')
-            replica.append_conf(
-                'recovery.conf',
-                "primary_conninfo = 'user={0} port={1} application_name={2}"
-                " sslmode=prefer sslcompression=1'".format(
-                    self.user, master.port, replica_name))
+
+            if not log_shipping:
+                replica.append_conf(
+                    'recovery.conf',
+                    "primary_conninfo = 'user={0} port={1} application_name={2}"
+                    " sslmode=prefer sslcompression=1'".format(
+                        self.user, master.port, replica_name))
 
         if synchronous:
             self.set_auto_conf(
@@ -1428,12 +1448,15 @@ class ProbackupTest(object):
     def get_bin_path(self, binary):
         return testgres.get_bin_path(binary)
 
-    def del_test_dir(self, module_name, fname):
+    def del_test_dir(self, module_name, fname, nodes=[]):
         """ Del testdir and optimistically try to del module dir"""
         try:
             testgres.clean_all()
         except:
             pass
+
+        for node in nodes:
+            node.stop()
 
         shutil.rmtree(
             os.path.join(

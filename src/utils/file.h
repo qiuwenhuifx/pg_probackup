@@ -12,6 +12,8 @@
 
 typedef enum
 {
+	/* message for compatibility check */
+	FIO_AGENT_VERSION, /* never move this */
 	FIO_OPEN,
 	FIO_CLOSE,
 	FIO_WRITE,
@@ -23,11 +25,11 @@ typedef enum
 	FIO_CHMOD,
 	FIO_SEEK,
 	FIO_TRUNCATE,
+	FIO_DELETE,
 	FIO_PREAD,
 	FIO_READ,
 	FIO_LOAD,
 	FIO_STAT,
-	FIO_FSTAT,
 	FIO_SEND,
 	FIO_ACCESS,
 	FIO_OPENDIR,
@@ -36,15 +38,22 @@ typedef enum
 	FIO_PAGE,
 	FIO_WRITE_COMPRESSED,
 	FIO_GET_CRC32,
+	/* used for incremental restore */
+	FIO_GET_CHECKSUM_MAP,
+	FIO_GET_LSN_MAP,
 	 /* used in fio_send_pages */
 	FIO_SEND_PAGES,
-	FIO_SEND_PAGES_PAGEMAP,
 	FIO_ERROR,
+	FIO_SEND_FILE,
+//	FIO_CHUNK,
 	FIO_SEND_FILE_EOF,
 	FIO_SEND_FILE_CORRUPTION,
+	FIO_SEND_FILE_HEADERS,
 	/* messages for closing connection */
 	FIO_DISCONNECT,
 	FIO_DISCONNECTED,
+	FIO_LIST_DIR,
+	FIO_CHECK_POSTMASTER
 } fio_operations;
 
 typedef enum
@@ -63,9 +72,11 @@ typedef enum
 
 typedef struct
 {
-	unsigned cop    : 5;
-	unsigned handle : 7;
-	unsigned size   : 20;
+//	fio_operations cop;
+//	16
+	unsigned cop    : 32;
+	unsigned handle : 32;
+	unsigned size   : 32;
 	unsigned arg;
 } fio_header;
 
@@ -77,6 +88,7 @@ extern fio_location MyLocation;
 extern void    fio_redirect(int in, int out, int err);
 extern void    fio_communicate(int in, int out);
 
+extern int     fio_get_agent_version(void);
 extern FILE*   fio_fopen(char const* name, char const* mode, fio_location location);
 extern size_t  fio_fwrite(FILE* f, void const* buf, size_t size);
 extern ssize_t fio_fwrite_compressed(FILE* f, void const* buf, size_t size, int compress_alg);
@@ -103,7 +115,7 @@ extern int     fio_sync(char const* path, fio_location location);
 extern pg_crc32 fio_get_crc32(const char *file_path, fio_location location, bool decompress);
 
 extern int     fio_rename(char const* old_path, char const* new_path, fio_location location);
-extern int     fio_symlink(char const* target, char const* link_path, fio_location location);
+extern int     fio_symlink(char const* target, char const* link_path, bool overwrite, fio_location location);
 extern int     fio_unlink(char const* path, fio_location location);
 extern int     fio_mkdir(char const* path, int mode, fio_location location);
 extern int     fio_chmod(char const* path, int mode, fio_location location);

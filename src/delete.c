@@ -89,7 +89,7 @@ do_delete(time_t backup_id)
 	if (!dry_run)
 	{
 		/* Lock marked for delete backups */
-		catalog_lock_backup_list(delete_list, parray_num(delete_list) - 1, 0);
+		catalog_lock_backup_list(delete_list, parray_num(delete_list) - 1, 0, false);
 
 		/* Delete backups from the end of list */
 		for (i = (int) parray_num(delete_list) - 1; i >= 0; i--)
@@ -123,7 +123,7 @@ do_delete(time_t backup_id)
  * which FULL backup should be keeped for redundancy obligation(only valid do),
  * but if invalid backup is not guarded by retention - it is removed
  */
-int do_retention(void)
+void do_retention(void)
 {
 	parray	   *backup_list = NULL;
 	parray	   *to_keep_list = parray_new();
@@ -154,7 +154,7 @@ int do_retention(void)
 			/* Retention is disabled but we still can cleanup wal */
 			elog(WARNING, "Retention policy is not set");
 			if (!delete_wal)
-				return 0;
+				return;
 		}
 		else
 			/* At least one retention policy is active */
@@ -196,9 +196,6 @@ int do_retention(void)
 	parray_free(backup_list);
 	parray_free(to_keep_list);
 	parray_free(to_purge_list);
-
-	return 0;
-
 }
 
 /* Evaluate every backup by retention policies and populate purge and keep lists.
@@ -513,7 +510,7 @@ do_retention_merge(parray *backup_list, parray *to_keep_list, parray *to_purge_l
 		parray_rm(to_purge_list, full_backup, pgBackupCompareId);
 
 		/* Lock merge chain */
-		catalog_lock_backup_list(merge_list, parray_num(merge_list) - 1, 0);
+		catalog_lock_backup_list(merge_list, parray_num(merge_list) - 1, 0, true);
 
 		/* Consider this extreme case */
 		//  PAGEa1    PAGEb1   both valid
@@ -630,7 +627,7 @@ do_retention_purge(parray *to_keep_list, parray *to_purge_list)
 			continue;
 
 		/* Actual purge */
-		if (!lock_backup(delete_backup))
+		if (!lock_backup(delete_backup, false))
 		{
 			/* If the backup still is used, do not interrupt and go to the next */
 			elog(WARNING, "Cannot lock backup %s directory, skip purging",
@@ -749,14 +746,14 @@ delete_backup_files(pgBackup *backup)
 	 * Update STATUS to BACKUP_STATUS_DELETING in preparation for the case which
 	 * the error occurs before deleting all backup files.
 	 */
-	write_backup_status(backup, BACKUP_STATUS_DELETING, instance_name);
+	write_backup_status(backup, BACKUP_STATUS_DELETING, instance_name, false);
 
 	/* list files to be deleted */
 	files = parray_new();
-	dir_list_file(files, backup->root_dir, false, true, true, 0, FIO_BACKUP_HOST);
+	dir_list_file(files, backup->root_dir, false, false, true, false, false, 0, FIO_BACKUP_HOST);
 
 	/* delete leaf node first */
-	parray_qsort(files, pgFileComparePathDesc);
+	parray_qsort(files, pgFileCompareRelPathWithExternalDesc);
 	num_files = parray_num(files);
 	for (i = 0; i < num_files; i++)
 	{
@@ -771,7 +768,7 @@ delete_backup_files(pgBackup *backup)
 			elog(INFO, "Progress: (%zd/%zd). Delete file \"%s\"",
 				 i + 1, num_files, full_path);
 
-		pgFileDelete(file, full_path);
+		pgFileDelete(file->mode, full_path);
 	}
 
 	parray_walk(files, pgFileFree);
@@ -926,29 +923,35 @@ delete_walfiles_in_tli(XLogRecPtr keep_lsn, timelineInfo *tlinfo,
 		 */
 		if (purge_all || wal_file->segno < OldestToKeepSegNo)
 		{
+			char wal_fullpath[MAXPGPATH];
+
+			join_path_components(wal_fullpath, instance_config.arclog_path, wal_file->file.name);
+
 			/* save segment from purging */
 			if (instance_config.wal_depth >= 0 && wal_file->keep)
 			{
-				elog(VERBOSE, "Retain WAL segment \"%s\"", wal_file->file.path);
+				elog(VERBOSE, "Retain WAL segment \"%s\"", wal_fullpath);
 				continue;
 			}
 
 			/* unlink segment */
-			if (fio_unlink(wal_file->file.path, FIO_BACKUP_HOST) < 0)
+			if (fio_unlink(wal_fullpath, FIO_BACKUP_HOST) < 0)
 			{
 				/* Missing file is not considered as error condition */
 				if (errno != ENOENT)
 					elog(ERROR, "Could not remove file \"%s\": %s",
-								 wal_file->file.path, strerror(errno));
+							wal_fullpath, strerror(errno));
 			}
 			else
 			{
 				if (wal_file->type == SEGMENT)
-					elog(VERBOSE, "Removed WAL segment \"%s\"", wal_file->file.path);
+					elog(VERBOSE, "Removed WAL segment \"%s\"", wal_fullpath);
+				else if (wal_file->type == TEMP_SEGMENT)
+					elog(VERBOSE, "Removed temp WAL segment \"%s\"", wal_fullpath);
 				else if (wal_file->type == PARTIAL_SEGMENT)
-					elog(VERBOSE, "Removed partial WAL segment \"%s\"", wal_file->file.path);
+					elog(VERBOSE, "Removed partial WAL segment \"%s\"", wal_fullpath);
 				else if (wal_file->type == BACKUP_HISTORY_FILE)
-					elog(VERBOSE, "Removed backup history file \"%s\"", wal_file->file.path);
+					elog(VERBOSE, "Removed backup history file \"%s\"", wal_fullpath);
 			}
 
 			wal_deleted = true;
@@ -962,16 +965,14 @@ int
 do_delete_instance(void)
 {
 	parray		*backup_list;
-	parray		*xlog_files_list;
 	int 		i;
-	int 		rc;
 	char		instance_config_path[MAXPGPATH];
 
 
 	/* Delete all backups. */
 	backup_list = catalog_get_backup_list(instance_name, INVALID_BACKUP_ID);
 
-	catalog_lock_backup_list(backup_list, 0, parray_num(backup_list) - 1);
+	catalog_lock_backup_list(backup_list, 0, parray_num(backup_list) - 1, true);
 
 	for (i = 0; i < parray_num(backup_list); i++)
 	{
@@ -984,24 +985,7 @@ do_delete_instance(void)
 	parray_free(backup_list);
 
 	/* Delete all wal files. */
-	xlog_files_list = parray_new();
-	dir_list_file(xlog_files_list, arclog_path, false, false, false, 0, FIO_BACKUP_HOST);
-
-	for (i = 0; i < parray_num(xlog_files_list); i++)
-	{
-		pgFile	   *wal_file = (pgFile *) parray_get(xlog_files_list, i);
-		if (S_ISREG(wal_file->mode))
-		{
-			rc = unlink(wal_file->path);
-			if (rc != 0)
-				elog(WARNING, "Failed to remove file \"%s\": %s",
-					 wal_file->path, strerror(errno));
-		}
-	}
-
-	/* Cleanup */
-	parray_walk(xlog_files_list, pgFileFree);
-	parray_free(xlog_files_list);
+	pgut_rmtree(arclog_path, false, true);
 
 	/* Delete backup instance config file */
 	join_path_components(instance_config_path, backup_instance_path, BACKUP_CATALOG_CONF_FILE);
@@ -1022,4 +1006,108 @@ do_delete_instance(void)
 
 	elog(INFO, "Instance '%s' successfully deleted", instance_name);
 	return 0;
+}
+
+/* Delete all backups of given status in instance */
+void
+do_delete_status(InstanceConfig *instance_config, const char *status)
+{
+	int         i;
+	parray     *backup_list, *delete_list;
+	const char *pretty_status;
+	int         n_deleted = 0, n_found = 0;
+	size_t      size_to_delete = 0;
+	char        size_to_delete_pretty[20];
+	pgBackup   *backup;
+
+	BackupStatus status_for_delete = str2status(status);
+	delete_list = parray_new();
+
+	if (status_for_delete == BACKUP_STATUS_INVALID)
+		elog(ERROR, "Unknown value for '--status' option: '%s'", status);
+
+	/*
+	 * User may have provided status string in lower case, but
+	 * we should print backup statuses consistently with show command,
+	 * so convert it.
+	 */
+	pretty_status = status2str(status_for_delete);
+
+	backup_list = catalog_get_backup_list(instance_config->name, INVALID_BACKUP_ID);
+
+	if (parray_num(backup_list) == 0)
+	{
+		elog(WARNING, "Instance '%s' has no backups", instance_config->name);
+		return;
+	}
+
+	if (dry_run)
+		elog(INFO, "Deleting all backups with status '%s' in dry run mode", pretty_status);
+	else
+		elog(INFO, "Deleting all backups with status '%s'", pretty_status);
+
+	/* Selects backups with specified status and their children into delete_list array. */
+	for (i = 0; i < parray_num(backup_list); i++)
+	{
+		backup = (pgBackup *) parray_get(backup_list, i);
+
+		if (backup->status == status_for_delete)
+		{
+			n_found++;
+
+			/* incremental backup can be already in delete_list due to append_children() */
+			if (parray_contains(delete_list, backup))
+				continue;
+			parray_append(delete_list, backup);
+
+			append_children(backup_list, backup, delete_list);
+		}
+	}
+
+	parray_qsort(delete_list, pgBackupCompareIdDesc);
+
+	/* delete and calculate free size from delete_list */
+	for (i = 0; i < parray_num(delete_list); i++)
+	{
+		backup = (pgBackup *)parray_get(delete_list, i);
+
+		elog(INFO, "Backup %s with status %s %s be deleted",
+			base36enc(backup->start_time), status2str(backup->status), dry_run ? "can" : "will");
+
+		size_to_delete += backup->data_bytes;
+		if (backup->stream)
+			size_to_delete += backup->wal_bytes;
+
+		if (!dry_run && lock_backup(backup, false))
+			delete_backup_files(backup);
+
+		n_deleted++;
+	}
+
+	/* Inform about data size to free */
+	if (size_to_delete >= 0)
+	{
+		pretty_size(size_to_delete, size_to_delete_pretty, lengthof(size_to_delete_pretty));
+		elog(INFO, "Resident data size to free by delete of %i backups: %s",
+			n_deleted, size_to_delete_pretty);
+	}
+
+	/* delete selected backups */
+	if (!dry_run && n_deleted > 0)
+		elog(INFO, "Successfully deleted %i %s from instance '%s'",
+			n_deleted, n_deleted == 1 ? "backup" : "backups",
+			instance_config->name);
+
+
+	if (n_found == 0)
+		elog(WARNING, "Instance '%s' has no backups with status '%s'",
+			instance_config->name, pretty_status);
+
+	// we don`t do WAL purge here, because it is impossible to correctly handle
+	// dry-run case.
+
+	/* Cleanup */
+	parray_free(delete_list);
+	parray_walk(backup_list, pgBackupFree);
+	parray_free(backup_list);
 }

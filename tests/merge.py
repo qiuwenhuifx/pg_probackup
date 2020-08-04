@@ -3,6 +3,7 @@
 import unittest
 import os
 from .helpers.ptrack_helpers import ProbackupTest, ProbackupException
+from testgres import QueryException
 import shutil
 from datetime import datetime, timedelta
 import time
@@ -22,8 +23,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         # Initialize instance and backup directory
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            initdb_params=["--data-checksums"]
-        )
+            initdb_params=["--data-checksums"])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, "node", node)
@@ -100,8 +100,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(count1, count2)
 
         # Clean after yourself
-        node.cleanup()
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     def test_merge_compressed_backups(self):
         """
@@ -176,10 +175,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True, initdb_params=["--data-checksums"],
-            pg_options={
-                'autovacuum': 'off'
-            }
-        )
+            pg_options={'autovacuum': 'off'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, "node", node)
@@ -187,7 +183,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         node.slow_start()
 
         # Fill with data
-        node.pgbench_init(scale=5)
+        node.pgbench_init(scale=10)
 
         # Do compressed FULL backup
         self.backup_node(backup_dir, "node", node, options=['--compress', '--stream'])
@@ -197,7 +193,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(show_backup["backup-mode"], "FULL")
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do compressed DELTA backup
@@ -206,7 +202,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             backup_type="delta", options=['--compress', '--stream'])
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do compressed PAGE backup
@@ -262,7 +258,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         node.slow_start()
 
         # Fill with data
-        node.pgbench_init(scale=5)
+        node.pgbench_init(scale=10)
 
         # Do compressed FULL backup
         self.backup_node(backup_dir, "node", node, options=[
@@ -273,7 +269,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(show_backup["backup-mode"], "FULL")
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do compressed DELTA backup
@@ -282,7 +278,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             options=['--compress', '--stream'])
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do uncompressed PAGE backup
@@ -348,7 +344,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(show_backup["backup-mode"], "FULL")
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do uncompressed DELTA backup
@@ -357,7 +353,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             options=['--stream'])
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do compressed PAGE backup
@@ -414,7 +410,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         node.slow_start()
 
         # Fill with data
-        node.pgbench_init(scale=5)
+        node.pgbench_init(scale=20)
 
         # Do uncompressed FULL backup
         self.backup_node(backup_dir, "node", node)
@@ -424,7 +420,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(show_backup["backup-mode"], "FULL")
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do compressed DELTA backup
@@ -433,7 +429,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             options=['--compress-algorithm=zlib', '--stream'])
 
         # Change data
-        pgbench = node.pgbench(options=['-T', '20', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
         # Do uncompressed PAGE backup
@@ -1479,10 +1475,12 @@ class MergeTest(ProbackupTest, unittest.TestCase):
 
         self.del_test_dir(module_name, fname)
 
+    @unittest.skip("skip")
     def test_crash_after_opening_backup_control_2(self):
         """
         check that crashing after opening backup_content.control
         for writing will not result in losing metadata about backup files
+        TODO: rewrite
         """
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -1531,8 +1529,8 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         gdb.set_breakpoint('write_backup_filelist')
         gdb.run_until_break()
 
-        gdb.set_breakpoint('fio_fwrite')
-        gdb.continue_execution_until_break(2)
+        gdb.set_breakpoint('sprintf')
+        gdb.continue_execution_until_break(1)
 
         gdb._execute('signal SIGKILL')
 
@@ -1569,10 +1567,12 @@ class MergeTest(ProbackupTest, unittest.TestCase):
 
         self.del_test_dir(module_name, fname)
 
+    @unittest.skip("skip")
     def test_losing_file_after_failed_merge(self):
         """
         check that crashing after opening backup_content.control
         for writing will not result in losing metadata about backup files
+        TODO: rewrite
         """
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -1622,8 +1622,8 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         gdb.set_breakpoint('write_backup_filelist')
         gdb.run_until_break()
 
-        gdb.set_breakpoint('fio_fwrite')
-        gdb.continue_execution_until_break(2)
+        gdb.set_breakpoint('sprintf')
+        gdb.continue_execution_until_break(20)
 
         gdb._execute('signal SIGKILL')
 
@@ -1981,8 +1981,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
             initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            pg_options={'autovacuum': 'off'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1993,7 +1992,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         # Take FULL
         self.backup_node(backup_dir, 'node', node)
 
-        node.pgbench_init(scale=3)
+        node.pgbench_init(scale=5)
 
         # Take PAGE from future
         backup_id = self.backup_node(
@@ -2013,11 +2012,10 @@ class MergeTest(ProbackupTest, unittest.TestCase):
             os.path.join(backup_dir, 'backups', 'node', backup_id),
             os.path.join(backup_dir, 'backups', 'node', new_id))
 
-        pgbench = node.pgbench(options=['-T', '3', '-c', '2', '--no-vacuum'])
+        pgbench = node.pgbench(options=['-T', '5', '-c', '1', '--no-vacuum'])
         pgbench.wait()
 
-        backup_id = self.backup_node(
-            backup_dir, 'node', node, backup_type='page')
+        backup_id = self.backup_node(backup_dir, 'node', node, backup_type='page')
         pgdata = self.pgdata_content(node.data_dir)
 
         result = node.safe_psql(
@@ -2246,7 +2244,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
                     repr(e.message), self.cmd))
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     # @unittest.skip("skip")
     def test_smart_merge(self):
@@ -2306,7 +2304,7 @@ class MergeTest(ProbackupTest, unittest.TestCase):
                 logfile_content = f.read()
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname)
+        self.del_test_dir(module_name, fname, [node])
 
     def test_idempotent_merge(self):
         """
@@ -2381,7 +2379,280 @@ class MergeTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(
             page_id_2, self.show_pb(backup_dir, 'node')[0]['id'])
 
+        self.del_test_dir(module_name, fname, [node])
 
+    def test_merge_correct_inheritance(self):
+        """
+        Make sure that backup metainformation fields
+        'note' and 'expire-time' are correctly inherited
+        during merge
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        # add database
+        node.safe_psql(
+            'postgres',
+            'CREATE DATABASE testdb')
+
+        # take FULL backup
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
+
+        # create database
+        node.safe_psql(
+            'postgres',
+            'create DATABASE testdb1')
+
+        # take PAGE backup
+        page_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='page')
+
+        self.set_backup(
+            backup_dir, 'node', page_id, options=['--note=hello', '--ttl=20d'])
+
+        page_meta = self.show_pb(backup_dir, 'node', page_id)
+
+        self.merge_backup(backup_dir, 'node', page_id)
+
+        print(self.show_pb(backup_dir, 'node', page_id))
+
+        self.assertEqual(
+            page_meta['note'],
+            self.show_pb(backup_dir, 'node', page_id)['note'])
+
+        self.assertEqual(
+            page_meta['expire-time'],
+            self.show_pb(backup_dir, 'node', page_id)['expire-time'])
+
+        self.del_test_dir(module_name, fname, [node])
+
+    def test_merge_correct_inheritance_1(self):
+        """
+        Make sure that backup metainformation fields
+        'note' and 'expire-time' are correctly inherited
+        during merge
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        # add database
+        node.safe_psql(
+            'postgres',
+            'CREATE DATABASE testdb')
+
+        # take FULL backup
+        self.backup_node(
+            backup_dir, 'node', node,
+            options=['--stream', '--note=hello', '--ttl=20d'])
+
+        # create database
+        node.safe_psql(
+            'postgres',
+            'create DATABASE testdb1')
+
+        # take PAGE backup
+        page_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='page')
+
+        self.merge_backup(backup_dir, 'node', page_id)
+
+        self.assertNotIn(
+            'note',
+            self.show_pb(backup_dir, 'node', page_id))
+
+        self.assertNotIn(
+            'expire-time',
+            self.show_pb(backup_dir, 'node', page_id))
+
+        self.del_test_dir(module_name, fname, [node])
+
+    # @unittest.skip("skip")
+    # @unittest.expectedFailure
+    def test_multi_timeline_merge(self):
+        """
+        Check that backup in PAGE mode choose
+        parent backup correctly:
+        t12        /---P-->
+        ...
+        t3      /---->
+        t2   /---->
+        t1 -F-----D->
+
+        P must have F as parent
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        node.safe_psql("postgres", "create extension pageinspect")
+
+        try:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck")
+        except QueryException as e:
+            node.safe_psql(
+                "postgres",
+                "create extension amcheck_next")
+
+        node.pgbench_init(scale=20)
+        full_id = self.backup_node(backup_dir, 'node', node)
+
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
+        pgbench.wait()
+
+        self.backup_node(backup_dir, 'node', node, backup_type='delta')
+
+        node.cleanup()
+        self.restore_node(
+            backup_dir, 'node', node, backup_id=full_id,
+            options=[
+                '--recovery-target=immediate',
+                '--recovery-target-action=promote'])
+
+        node.slow_start()
+
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
+        pgbench.wait()
+
+        # create timelines
+        for i in range(2, 7):
+            node.cleanup()
+            self.restore_node(
+                backup_dir, 'node', node,
+                options=[
+                    '--recovery-target=latest',
+                    '--recovery-target-action=promote',
+                    '--recovery-target-timeline={0}'.format(i)])
+            node.slow_start()
+
+            # at this point there is i+1 timeline
+            pgbench = node.pgbench(options=['-T', '20', '-c', '1', '--no-vacuum'])
+            pgbench.wait()
+
+            # create backup at 2, 4 and 6 timeline
+            if i % 2 == 0:
+                self.backup_node(backup_dir, 'node', node, backup_type='page')
+
+        page_id = self.backup_node(backup_dir, 'node', node, backup_type='page')
+        pgdata = self.pgdata_content(node.data_dir)
+
+        self.merge_backup(backup_dir, 'node', page_id)
+
+        result = node.safe_psql(
+            "postgres", "select * from pgbench_accounts")
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        self.restore_node(backup_dir, 'node', node_restored)
+        pgdata_restored = self.pgdata_content(node_restored.data_dir)
+
+        self.set_auto_conf(node_restored, {'port': node_restored.port})
+        node_restored.slow_start()
+
+        result_new = node_restored.safe_psql(
+            "postgres", "select * from pgbench_accounts")
+
+        self.assertEqual(result, result_new)
+
+        self.compare_pgdata(pgdata, pgdata_restored)
+
+        self.checkdb_node(
+            backup_dir,
+            'node',
+            options=[
+                '--amcheck',
+                '-d', 'postgres', '-p', str(node.port)])
+
+        self.checkdb_node(
+            backup_dir,
+            'node',
+            options=[
+                '--amcheck',
+                '-d', 'postgres', '-p', str(node_restored.port)])
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname, [node, node_restored])
+
+    # @unittest.skip("skip")
+    # @unittest.expectedFailure
+    def test_merge_page_header_map_retry(self):
+        """
+        page header map cannot be trusted when
+        running retry
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        node.slow_start()
+
+        node.pgbench_init(scale=20)
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
+
+        pgbench = node.pgbench(options=['-T', '10', '-c', '1', '--no-vacuum'])
+        pgbench.wait()
+
+        delta_id = self.backup_node(
+            backup_dir, 'node', node,
+            backup_type='delta', options=['--stream'])
+
+        pgdata = self.pgdata_content(node.data_dir)
+
+        gdb = self.merge_backup(backup_dir, 'node', delta_id, gdb=True)
+
+        # our goal here is to get full backup with merged data files,
+        # but with old page header map
+        gdb.set_breakpoint('cleanup_header_map')
+        gdb.run_until_break()
+        gdb._execute('signal SIGKILL')
+
+        self.merge_backup(backup_dir, 'node', delta_id)
+
+        node.cleanup()
+
+        self.restore_node(backup_dir, 'node', node)
+        pgdata_restored = self.pgdata_content(node.data_dir)
+        self.compare_pgdata(pgdata, pgdata_restored)
+
+        # Clean after yourself
         self.del_test_dir(module_name, fname)
 
 # 1. Need new test with corrupted FULL backup

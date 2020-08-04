@@ -80,10 +80,10 @@ static void backup_cleanup(bool fatal, void *userdata);
 
 static void *backup_files(void *arg);
 
-static void do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync);
+static void do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs);
 
 static void pg_start_backup(const char *label, bool smooth, pgBackup *backup,
-							PGNodeInfo *nodeInfo, PGconn *backup_conn, PGconn *master_conn);
+							PGNodeInfo *nodeInfo, PGconn *conn);
 static void pg_switch_wal(PGconn *conn);
 static void pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn, PGNodeInfo *nodeInfo);
 static int checkpoint_timeout(PGconn *backup_conn);
@@ -129,7 +129,7 @@ backup_stopbackup_callback(bool fatal, void *userdata)
  * Move files from 'pgdata' to a subdirectory in 'backup_path'.
  */
 static void
-do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
+do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs)
 {
 	int			i;
 	char		database_path[MAXPGPATH];
@@ -149,13 +149,8 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 	parray	   *external_dirs = NULL;
 	parray	   *database_map = NULL;
 
-	pgFile	   *pg_control = NULL;
-	PGconn	   *master_conn = NULL;
-	PGconn	   *pg_startbackup_conn = NULL;
-
 	/* used for multitimeline incremental backup */
 	parray       *tli_list = NULL;
-
 
 	/* for fancy reporting */
 	time_t		start_time, end_time;
@@ -170,12 +165,33 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		check_external_for_tablespaces(external_dirs, backup_conn);
 	}
 
+	/* Clear ptrack files for not PTRACK backups */
+	if (current.backup_mode != BACKUP_MODE_DIFF_PTRACK && nodeInfo->is_ptrack_enable)
+		pg_ptrack_clear(backup_conn, nodeInfo->ptrack_version_num);
+
+	/* notify start of backup to PostgreSQL server */
+	time2iso(label, lengthof(label), current.start_time);
+	strncat(label, " with pg_probackup", lengthof(label) -
+			strlen(" with pg_probackup"));
+
+	/* Call pg_start_backup function in PostgreSQL connect */
+	pg_start_backup(label, smooth_checkpoint, &current, nodeInfo, backup_conn);
+
 	/* Obtain current timeline */
 #if PG_VERSION_NUM >= 90600
 	current.tli = get_current_timeline(backup_conn);
 #else
 	current.tli = get_current_timeline_from_control(false);
 #endif
+
+	/* In PAGE mode or in ARCHIVE wal-mode wait for current segment */
+	if (current.backup_mode == BACKUP_MODE_DIFF_PAGE ||!stream_wal)
+		/*
+		 * Do not wait start_lsn for stream backup.
+		 * Because WAL streaming will start after pg_start_backup() in stream
+		 * mode.
+		 */
+		wait_wal_lsn(current.start_lsn, true, current.tli, false, true, ERROR, false);
 
 	/*
 	 * In incremental backup mode ensure that already-validated
@@ -193,9 +209,10 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		{
 			/* try to setup multi-timeline backup chain */
 			elog(WARNING, "Valid backup on current timeline %u is not found, "
-						"try to look up on previous timelines",
+						"trying to look up on previous timelines",
 						current.tli);
 
+			/* TODO: use read_timeline_history */
 			tli_list = catalog_get_timelines(&instance_config);
 
 			if (parray_num(tli_list) == 0)
@@ -218,62 +235,57 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 	if (prev_backup)
 	{
-		char		prev_backup_filelist_path[MAXPGPATH];
+        if (parse_program_version(prev_backup->program_version) > parse_program_version(PROGRAM_VERSION))
+            elog(ERROR, "pg_probackup binary version is %s, but backup %s version is %s. "
+                        "pg_probackup do not guarantee to be forward compatible. "
+                        "Please upgrade pg_probackup binary.",
+                        PROGRAM_VERSION, base36enc(prev_backup->start_time), prev_backup->program_version);
 
 		elog(INFO, "Parent backup: %s", base36enc(prev_backup->start_time));
 
-		join_path_components(prev_backup_filelist_path, prev_backup->root_dir,
-															DATABASE_FILE_LIST);
 		/* Files of previous backup needed by DELTA backup */
-		prev_backup_filelist = dir_read_file_list(NULL, NULL, prev_backup_filelist_path, FIO_BACKUP_HOST);
+		prev_backup_filelist = get_backup_filelist(prev_backup, true);
 
 		/* If lsn is not NULL, only pages with higher lsn will be copied. */
 		prev_backup_start_lsn = prev_backup->start_lsn;
 		current.parent_backup = prev_backup->start_time;
 
-		write_backup(&current);
+		write_backup(&current, true);
 	}
 
 	/*
 	 * It`s illegal to take PTRACK backup if LSN from ptrack_control() is not
-	 * equal to stop_lsn of previous backup.
+	 * equal to start_lsn of previous backup.
 	 */
 	if (current.backup_mode == BACKUP_MODE_DIFF_PTRACK)
 	{
 		XLogRecPtr	ptrack_lsn = get_last_ptrack_lsn(backup_conn, nodeInfo);
 
-		if (ptrack_lsn > prev_backup->stop_lsn || ptrack_lsn == InvalidXLogRecPtr)
+		if (nodeInfo->ptrack_version_num < 20)
 		{
-			elog(ERROR, "LSN from ptrack_control %X/%X differs from STOP LSN of previous backup %X/%X.\n"
-						"Create new full backup before an incremental one.",
-						(uint32) (ptrack_lsn >> 32), (uint32) (ptrack_lsn),
-						(uint32) (prev_backup->stop_lsn >> 32),
-						(uint32) (prev_backup->stop_lsn));
+			// backward compatibility kludge: use Stop LSN for ptrack 1.x,
+			if (ptrack_lsn > prev_backup->stop_lsn || ptrack_lsn == InvalidXLogRecPtr)
+			{
+				elog(ERROR, "LSN from ptrack_control %X/%X differs from Stop LSN of previous backup %X/%X.\n"
+							"Create new full backup before an incremental one.",
+							(uint32) (ptrack_lsn >> 32), (uint32) (ptrack_lsn),
+							(uint32) (prev_backup->stop_lsn >> 32),
+							(uint32) (prev_backup->stop_lsn));
+			}
+		}
+		else
+		{
+			// new ptrack is more robust and checks Start LSN
+			if (ptrack_lsn > prev_backup->start_lsn || ptrack_lsn == InvalidXLogRecPtr)
+			{
+				elog(ERROR, "LSN from ptrack_control %X/%X is greater than Start LSN of previous backup %X/%X.\n"
+							"Create new full backup before an incremental one.",
+							(uint32) (ptrack_lsn >> 32), (uint32) (ptrack_lsn),
+							(uint32) (prev_backup->start_lsn >> 32),
+							(uint32) (prev_backup->start_lsn));
+			}
 		}
 	}
-
-	/* Clear ptrack files for FULL and PAGE backup */
-	if (current.backup_mode != BACKUP_MODE_DIFF_PTRACK && nodeInfo->is_ptrack_enable)
-		pg_ptrack_clear(backup_conn, nodeInfo->ptrack_version_num);
-
-	/* notify start of backup to PostgreSQL server */
-	time2iso(label, lengthof(label), current.start_time);
-	strncat(label, " with pg_probackup", lengthof(label) -
-			strlen(" with pg_probackup"));
-
-	/* Create connection to master server needed to call pg_start_backup */
-	if (current.from_replica && exclusive_backup)
-	{
-		master_conn = pgut_connect(instance_config.master_conn_opt.pghost,
-								   instance_config.master_conn_opt.pgport,
-								   instance_config.master_conn_opt.pgdatabase,
-								   instance_config.master_conn_opt.pguser);
-		pg_startbackup_conn = master_conn;
-	}
-	else
-		pg_startbackup_conn = backup_conn;
-
-	pg_start_backup(label, smooth_checkpoint, &current, nodeInfo, backup_conn, pg_startbackup_conn);
 
 	/* For incremental backup check that start_lsn is not from the past
 	 * Though it will not save us if PostgreSQL instance is actually
@@ -288,7 +300,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 				base36enc(prev_backup->start_time));
 
 	/* Update running backup meta with START LSN */
-	write_backup(&current);
+	write_backup(&current, true);
 
 	pgBackupGetPath(&current, database_path, lengthof(database_path),
 					DATABASE_DIR);
@@ -331,25 +343,37 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 	backup_files_list = parray_new();
 
 	/* list files with the logical path. omit $PGDATA */
-	dir_list_file(backup_files_list, instance_config.pgdata,
-				  true, true, false, 0, FIO_DB_HOST);
+	if (fio_is_remote(FIO_DB_HOST))
+		fio_list_dir(backup_files_list, instance_config.pgdata,
+					 true, true, false, backup_logs, true, 0);
+	else
+		dir_list_file(backup_files_list, instance_config.pgdata,
+					  true, true, false, backup_logs, true, 0, FIO_LOCAL_HOST);
 
 	/*
 	 * Get database_map (name to oid) for use in partial restore feature.
 	 * It's possible that we fail and database_map will be NULL.
 	 */
-	database_map = get_database_map(pg_startbackup_conn);
+	database_map = get_database_map(backup_conn);
 
 	/*
 	 * Append to backup list all files and directories
 	 * from external directory option
 	 */
 	if (external_dirs)
+	{
 		for (i = 0; i < parray_num(external_dirs); i++)
+		{
 			/* External dirs numeration starts with 1.
 			 * 0 value is not external dir */
-			dir_list_file(backup_files_list, parray_get(external_dirs, i),
-						  false, true, false, i+1, FIO_DB_HOST);
+			if (fio_is_remote(FIO_DB_HOST))
+				fio_list_dir(backup_files_list, parray_get(external_dirs, i),
+							 false, true, false, false, true, i+1);
+			else
+				dir_list_file(backup_files_list, parray_get(external_dirs, i),
+							  false, true, false, false, true, i+1, FIO_LOCAL_HOST);
+		}
+	}
 
 	/* close ssh session in main thread */
 	fio_disconnect();
@@ -370,6 +394,12 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		if (file->external_dir_num != 0)
 			continue;
 
+		if (S_ISDIR(file->mode))
+		{
+			current.pgdata_bytes += 4096;
+			continue;
+		}
+
 		current.pgdata_bytes += file->size;
 	}
 
@@ -387,17 +417,17 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 	 * Sorted array is used at least in parse_filelist_filenames(),
 	 * extractPageMap(), make_pagemap_from_ptrack().
 	 */
-	parray_qsort(backup_files_list, pgFileComparePath);
+	parray_qsort(backup_files_list, pgFileCompareRelPathWithExternal);
 
 	/* Extract information about files in backup_list parsing their names:*/
 	parse_filelist_filenames(backup_files_list, instance_config.pgdata);
 
 	if (current.backup_mode != BACKUP_MODE_FULL)
 	{
-		elog(LOG, "current_tli:%X", current.tli);
-		elog(LOG, "prev_backup->start_lsn: %X/%X",
+		elog(LOG, "Current tli: %X", current.tli);
+		elog(LOG, "Parent start_lsn: %X/%X",
 			 (uint32) (prev_backup->start_lsn >> 32), (uint32) (prev_backup->start_lsn));
-		elog(LOG, "current.start_lsn: %X/%X",
+		elog(LOG, "start_lsn: %X/%X",
 			 (uint32) (current.start_lsn >> 32), (uint32) (current.start_lsn));
 	}
 
@@ -429,10 +459,11 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 			/*
 			 * Build the page map from ptrack information.
 			 */
-			if (nodeInfo->ptrack_version_num == 20)
+			if (nodeInfo->ptrack_version_num >= 20)
 				make_pagemap_from_ptrack_2(backup_files_list, backup_conn,
-											nodeInfo->ptrack_schema,
-											prev_backup_start_lsn);
+										   nodeInfo->ptrack_schema,
+										   nodeInfo->ptrack_version_num,
+										   prev_backup_start_lsn);
 			else if (nodeInfo->ptrack_version_num == 15 ||
 					 nodeInfo->ptrack_version_num == 16 ||
 					 nodeInfo->ptrack_version_num == 17)
@@ -443,7 +474,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 		/* TODO: add ms precision */
 		if (pagemap_isok)
-			elog(INFO, "Pagemap successfully extracted, time elapsed %.0f sec",
+			elog(INFO, "Pagemap successfully extracted, time elapsed: %.0f sec",
 				 difftime(end_time, start_time));
 		else
 			elog(ERROR, "Pagemap extraction failed, time elasped: %.0f sec",
@@ -461,26 +492,18 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		if (S_ISDIR(file->mode))
 		{
 			char		dirpath[MAXPGPATH];
-			char	   *dir_name;
-
-			if (file->external_dir_num)
-				dir_name = GetRelativePath(file->path,
-								parray_get(external_dirs,
-											file->external_dir_num - 1));
-			else
-				dir_name = GetRelativePath(file->path, instance_config.pgdata);
-
-			elog(VERBOSE, "Create directory \"%s\"", dir_name);
 
 			if (file->external_dir_num)
 			{
 				char		temp[MAXPGPATH];
 				snprintf(temp, MAXPGPATH, "%s%d", external_prefix,
 						 file->external_dir_num);
-				join_path_components(dirpath, temp, dir_name);
+				join_path_components(dirpath, temp, file->rel_path);
 			}
 			else
-				join_path_components(dirpath, database_path, dir_name);
+				join_path_components(dirpath, database_path, file->rel_path);
+
+			elog(VERBOSE, "Create directory '%s'", dirpath);
 			fio_mkdir(dirpath, DIR_PERMISSION, FIO_BACKUP_HOST);
 		}
 
@@ -496,8 +519,11 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 	/* write initial backup_content.control file and update backup.control  */
 	write_backup_filelist(&current, backup_files_list,
-						  instance_config.pgdata, external_dirs);
-	write_backup(&current);
+						  instance_config.pgdata, external_dirs, true);
+	write_backup(&current, true);
+
+	/* Init backup page header map */
+	init_header_map(&current);
 
 	/* init thread args with own file lists */
 	threads = (pthread_t *) palloc(sizeof(pthread_t) * num_threads);
@@ -517,6 +543,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		arg->prev_start_lsn = prev_backup_start_lsn;
 		arg->conn_arg.conn = NULL;
 		arg->conn_arg.cancel_conn = NULL;
+		arg->hdr_map = &(current.hdr_map);
 		arg->thread_num = i+1;
 		/* By default there are some error */
 		arg->ret = 1;
@@ -552,19 +579,6 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		elog(ERROR, "Data files transferring failed, time elapsed: %s",
 			pretty_time);
 
-	/* Remove disappeared during backup files from backup_list */
-	for (i = 0; i < parray_num(backup_files_list); i++)
-	{
-		pgFile	   *tmp_file = (pgFile *) parray_get(backup_files_list, i);
-
-		if (tmp_file->write_size == FILE_NOT_FOUND)
-		{
-			pgFileFree(tmp_file);
-			parray_remove(backup_files_list, i);
-			i--;
-		}
-	}
-
 	/* clean previous backup file list */
 	if (prev_backup_filelist)
 	{
@@ -573,26 +587,21 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 	}
 
 	/* Notify end of backup */
-	pg_stop_backup(&current, pg_startbackup_conn, nodeInfo);
-
-	elog(LOG, "current.stop_lsn: %X/%X",
-		 (uint32) (stop_backup_lsn >> 32), (uint32) (stop_backup_lsn));
+	pg_stop_backup(&current, backup_conn, nodeInfo);
 
 	/* In case of backup from replica >= 9.6 we must fix minRecPoint,
 	 * First we must find pg_control in backup_files_list.
 	 */
 	if (current.from_replica && !exclusive_backup)
 	{
-		char		pg_control_path[MAXPGPATH];
-
-		snprintf(pg_control_path, sizeof(pg_control_path), "%s/%s",
-				 instance_config.pgdata, XLOG_CONTROL_FILE);
+		pgFile	   *pg_control = NULL;
 
 		for (i = 0; i < parray_num(backup_files_list); i++)
 		{
 			pgFile	   *tmp_file = (pgFile *) parray_get(backup_files_list, i);
 
-			if (strcmp(tmp_file->path, pg_control_path) == 0)
+			if (tmp_file->external_dir_num == 0 &&
+				(strcmp(tmp_file->rel_path, XLOG_CONTROL_FILE) == 0))
 			{
 				pg_control = tmp_file;
 				break;
@@ -601,9 +610,18 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 		if (!pg_control)
 			elog(ERROR, "Failed to find file \"%s\" in backup filelist.",
-							pg_control_path);
+							XLOG_CONTROL_FILE);
 
 		set_min_recovery_point(pg_control, database_path, current.stop_lsn);
+	}
+
+	/* close and sync page header map */
+	if (current.hdr_map.fp)
+	{
+		cleanup_header_map(&(current.hdr_map));
+
+		if (fio_sync(current.hdr_map.path, FIO_BACKUP_HOST) != 0)
+			elog(ERROR, "Cannot sync file \"%s\": %s", current.hdr_map.path, strerror(errno));
 	}
 
 	/* close ssh session in main thread */
@@ -619,7 +637,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 		/* Scan backup PG_XLOG_DIR */
 		xlog_files_list = parray_new();
 		join_path_components(pg_xlog_path, database_path, PG_XLOG_DIR);
-		dir_list_file(xlog_files_list, pg_xlog_path, false, true, false, 0,
+		dir_list_file(xlog_files_list, pg_xlog_path, false, true, false, false, true, 0,
 					  FIO_BACKUP_HOST);
 
 		/* TODO: Drop streamed WAL segments greater than stop_lsn */
@@ -629,21 +647,28 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 			join_path_components(wal_full_path, pg_xlog_path, file->rel_path);
 
-			if (S_ISREG(file->mode))
-			{
-				file->crc = pgFileGetCRC(wal_full_path, true, false);
-				file->write_size = file->size;
-			}
-			/* Remove file path root prefix*/
-			if (strstr(file->path, database_path) == file->path)
-			{
-				char	   *ptr = file->path;
+			if (!S_ISREG(file->mode))
+				continue;
 
-				file->path = pgut_strdup(GetRelativePath(ptr, database_path));
-				file->rel_path = pgut_strdup(file->path);
-				free(ptr);
-			}
+			file->crc = pgFileGetCRC(wal_full_path, true, false);
+			file->write_size = file->size;
+
+			/* overwrite rel_path, because now it is relative to
+			 * /backup_dir/backups/instance_name/backup_id/database/pg_xlog/
+			 */
+			pg_free(file->rel_path);
+
+			/* Now it is relative to /backup_dir/backups/instance_name/backup_id/database/ */
+			file->rel_path = pgut_strdup(GetRelativePath(wal_full_path, database_path));
+
+			file->name = last_dir_separator(file->rel_path);
+
+			if (file->name == NULL) // TODO: do it in pgFileInit
+				file->name = file->rel_path;
+			else
+				file->name++;
 		}
+
 		/* Add xlog files into the list of backed up files */
 		parray_concat(backup_files_list, xlog_files_list);
 		parray_free(xlog_files_list);
@@ -660,9 +685,9 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 	/* Print the list of files to backup catalog */
 	write_backup_filelist(&current, backup_files_list, instance_config.pgdata,
-						  external_dirs);
+						  external_dirs, true);
 	/* update backup control file to update size info */
-	write_backup(&current);
+	write_backup(&current, true);
 
 	/* Sync all copied files unless '--no-sync' flag is used */
 	if (no_sync)
@@ -674,8 +699,8 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 
 		for (i = 0; i < parray_num(backup_files_list); i++)
 		{
-			char		to_fullpath[MAXPGPATH];
-			pgFile	   *file = (pgFile *) parray_get(backup_files_list, i);
+			char    to_fullpath[MAXPGPATH];
+			pgFile *file = (pgFile *) parray_get(backup_files_list, i);
 
 			/* TODO: sync directory ? */
 			if (S_ISDIR(file->mode))
@@ -697,7 +722,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync)
 			}
 
 			if (fio_sync(to_fullpath, FIO_BACKUP_HOST) != 0)
-				elog(ERROR, "Failed to sync file \"%s\": %s", to_fullpath, strerror(errno));
+				elog(ERROR, "Cannot sync file \"%s\": %s", to_fullpath, strerror(errno));
 		}
 
 		time(&end_time);
@@ -803,8 +828,8 @@ pgdata_basic_setup(ConnectionOptions conn_opt, PGNodeInfo *nodeInfo)
  * Entry point of pg_probackup BACKUP subcommand.
  */
 int
-do_backup(time_t start_time, bool no_validate,
-			pgSetBackupParams *set_backup_params, bool no_sync)
+do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
+			bool no_validate, bool no_sync, bool backup_logs)
 {
 	PGconn		*backup_conn = NULL;
 	PGNodeInfo	nodeInfo;
@@ -820,6 +845,7 @@ do_backup(time_t start_time, bool no_validate,
 	/* Update backup status and other metainfo. */
 	current.status = BACKUP_STATUS_RUNNING;
 	current.start_time = start_time;
+
 	StrNCpy(current.program_version, PROGRAM_VERSION,
 			sizeof(current.program_version));
 
@@ -840,10 +866,10 @@ do_backup(time_t start_time, bool no_validate,
 	/* Create backup directory and BACKUP_CONTROL_FILE */
 	if (pgBackupCreateDir(&current))
 		elog(ERROR, "Cannot create backup directory");
-	if (!lock_backup(&current))
+	if (!lock_backup(&current, true))
 		elog(ERROR, "Cannot lock backup %s directory",
 			 base36enc(current.start_time));
-	write_backup(&current);
+	write_backup(&current, true);
 
 	/* set the error processing function for the backup process */
 	pgut_atexit_push(backup_cleanup, NULL);
@@ -876,15 +902,10 @@ do_backup(time_t start_time, bool no_validate,
 #endif
 
 	get_ptrack_version(backup_conn, &nodeInfo);
-//	elog(WARNING, "ptrack_version_num %d", ptrack_version_num);
+	//	elog(WARNING, "ptrack_version_num %d", ptrack_version_num);
 
 	if (nodeInfo.ptrack_version_num > 0)
-	{
-		if (nodeInfo.ptrack_version_num >= 20)
-			nodeInfo.is_ptrack_enable = pg_ptrack_enable2(backup_conn);
-		else
-			nodeInfo.is_ptrack_enable = pg_ptrack_enable(backup_conn);
-	}
+		nodeInfo.is_ptrack_enable = pg_ptrack_enable(backup_conn, nodeInfo.ptrack_version_num);
 
 	if (current.backup_mode == BACKUP_MODE_DIFF_PTRACK)
 	{
@@ -902,8 +923,12 @@ do_backup(time_t start_time, bool no_validate,
 		if (instance_config.master_conn_opt.pghost == NULL)
 			elog(ERROR, "Options for connection to master must be provided to perform backup from replica");
 
+	/* add note to backup if requested */
+	if (set_backup_params && set_backup_params->note)
+		add_note(&current, set_backup_params->note);
+
 	/* backup data */
-	do_backup_instance(backup_conn, &nodeInfo, no_sync);
+	do_backup_instance(backup_conn, &nodeInfo, no_sync, backup_logs);
 	pgut_atexit_pop(backup_cleanup, NULL);
 
 	/* compute size of wal files of this backup stored in the archive */
@@ -927,15 +952,14 @@ do_backup(time_t start_time, bool no_validate,
 	/* Backup is done. Update backup status */
 	current.end_time = time(NULL);
 	current.status = BACKUP_STATUS_DONE;
-	write_backup(&current);
+	write_backup(&current, true);
 
 	/* Pin backup if requested */
 	if (set_backup_params &&
 		(set_backup_params->ttl > 0 ||
 		 set_backup_params->expire_time > 0))
 	{
-		if (!pin_backup(&current, set_backup_params))
-			elog(ERROR, "Failed to pin the backup %s", base36enc(current.backup_id));
+		pin_backup(&current, set_backup_params);
 	}
 
 	if (!no_validate)
@@ -1107,18 +1131,14 @@ confirm_block_size(PGconn *conn, const char *name, int blcksz)
  */
 static void
 pg_start_backup(const char *label, bool smooth, pgBackup *backup,
-				PGNodeInfo *nodeInfo, PGconn *backup_conn, PGconn *pg_startbackup_conn)
+				PGNodeInfo *nodeInfo, PGconn *conn)
 {
 	PGresult   *res;
 	const char *params[2];
 	uint32		lsn_hi;
 	uint32		lsn_lo;
-	PGconn	   *conn;
 
 	params[0] = label;
-
-	/* For 9.5 replica we call pg_start_backup() on master */
-	conn = pg_startbackup_conn;
 
 	/* 2nd argument is 'fast'*/
 	params[1] = smooth ? "false" : "true";
@@ -1138,7 +1158,7 @@ pg_start_backup(const char *label, bool smooth, pgBackup *backup,
 	 * is necessary to call pg_stop_backup() in backup_cleanup().
 	 */
 	backup_in_progress = true;
-	pgut_atexit_push(backup_stopbackup_callback, pg_startbackup_conn);
+	pgut_atexit_push(backup_stopbackup_callback, conn);
 
 	/* Extract timeline and LSN from results of pg_start_backup() */
 	XLogDataFromLSN(PQgetvalue(res, 0, 0), &lsn_hi, &lsn_lo);
@@ -1158,15 +1178,6 @@ pg_start_backup(const char *label, bool smooth, pgBackup *backup,
 		 * (because in 9.5 only superuser can switch WAL)
 		 */
 		pg_switch_wal(conn);
-
-	/* In PAGE mode or in ARCHIVE wal-mode wait for current segment */
-	if (current.backup_mode == BACKUP_MODE_DIFF_PAGE ||!stream_wal)
-		/*
-		 * Do not wait start_lsn for stream backup.
-		 * Because WAL streaming will start after pg_start_backup() in stream
-		 * mode.
-		 */
-		wait_wal_lsn(backup->start_lsn, true, backup->tli, false, true, ERROR, false);
 }
 
 /*
@@ -1735,73 +1746,83 @@ pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
 		/* Calculate LSN */
 		stop_backup_lsn_tmp = ((uint64) lsn_hi) << 32 | lsn_lo;
 
+		/* It is ok for replica to return invalid STOP LSN
+		 * UPD: Apparently it is ok even for a master.
+		 */
 		if (!XRecOffIsValid(stop_backup_lsn_tmp))
 		{
-			/* It is ok for replica to return STOP LSN with NullXRecOff */
-			if (backup->from_replica && XRecOffIsNull(stop_backup_lsn_tmp))
+			char	   *xlog_path,
+						stream_xlog_path[MAXPGPATH];
+			XLogSegNo	segno = 0;
+			XLogRecPtr	lsn_tmp = InvalidXLogRecPtr;
+
+			/*
+			 * Even though the value is invalid, it's expected postgres behaviour
+			 * and we're trying to fix it below.
+			 */
+			elog(LOG, "Invalid offset in stop_lsn value %X/%X, trying to fix",
+				 (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
+
+			/*
+			 * Note: even with gdb it is very hard to produce automated tests for
+			 * contrecord + invalid LSN, so emulate it for manual testing.
+			 */
+			//stop_backup_lsn_tmp = stop_backup_lsn_tmp - XLOG_SEG_SIZE;
+			//elog(WARNING, "New Invalid stop_backup_lsn value %X/%X",
+			//	 (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
+
+			if (stream_wal)
 			{
-				char	   *xlog_path,
-							stream_xlog_path[MAXPGPATH];
-				XLogSegNo	segno = 0;
-				XLogRecPtr	lsn_tmp = InvalidXLogRecPtr;
+				pgBackupGetPath2(backup, stream_xlog_path,
+								 lengthof(stream_xlog_path),
+								 DATABASE_DIR, PG_XLOG_DIR);
+				xlog_path = stream_xlog_path;
+			}
+			else
+				xlog_path = arclog_path;
 
-				/*
-				 * Even though the value is invalid, it's expected postgres behaviour
-				 * and we're trying to fix it below.
-				 */
-				elog(LOG, "Null offset in stop_backup_lsn value %X/%X, trying to fix",
-					 (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
+			GetXLogSegNo(stop_backup_lsn_tmp, segno, instance_config.xlog_seg_size);
 
-				/*
-				 * Note: even with gdb it is very hard to produce automated tests for
-				 * contrecord + NullXRecOff, so emulate it for manual testing.
-				 */
-				//stop_backup_lsn_tmp = stop_backup_lsn_tmp - XLOG_SEG_SIZE;
-				//elog(WARNING, "New Invalid stop_backup_lsn value %X/%X",
-				//	 (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
+			/*
+			 * Note, that there is no guarantee that corresponding WAL file even exists.
+			 * Replica may return LSN from future and keep staying in present.
+			 * Or it can return invalid LSN.
+			 *
+			 * That's bad, since we want to get real LSN to save it in backup label file
+			 * and to use it in WAL validation.
+			 *
+			 * So we try to do the following:
+			 * 1. Wait 'archive_timeout' seconds for segment containing stop_lsn and
+			 *	  look for the first valid record in it.
+			 * 	  It solves the problem of occasional invalid LSN on write-busy system.
+			 * 2. Failing that, look for record in previous segment with endpoint
+			 *	  equal or greater than stop_lsn. It may(!) solve the problem of invalid LSN
+			 *	  on write-idle system. If that fails too, error out.
+			 */
 
-				if (stream_wal)
-				{
-					pgBackupGetPath2(backup, stream_xlog_path,
-									 lengthof(stream_xlog_path),
-									 DATABASE_DIR, PG_XLOG_DIR);
-					xlog_path = stream_xlog_path;
-				}
-				else
-					xlog_path = arclog_path;
-
-				GetXLogSegNo(stop_backup_lsn_tmp, segno, instance_config.xlog_seg_size);
-
-				/*
-				 * Note, that there is no guarantee that corresponding WAL file even exists.
-				 * Replica may return LSN from future and keep staying in present.
-				 * Or it can return LSN with NullXRecOff.
-				 *
-				 * That's bad, since we want to get real LSN to save it in backup label file
-				 * and to use it in WAL validation.
-				 *
-				 * So we try to do the following:
-				 * 1. Wait 'archive_timeout' seconds for segment containing stop_lsn and
-				 *	  look for the first valid record in it.
-				 * 	  It solves the problem of occasional invalid XRecOff on write-busy system.
-				 * 2. Failing that, look for record in previous segment with endpoint
-				 *	  equal or greater than stop_lsn. It may(!) solve the problem of NullXRecOff
-				 *	  on write-idle system. If that fails too, error out.
-				 */
-
+			/* stop_lsn is pointing to a 0 byte of xlog segment */
+			if (stop_backup_lsn_tmp % instance_config.xlog_seg_size == 0)
+			{
 				/* Wait for segment with current stop_lsn, it is ok for it to never arrive */
 				wait_wal_lsn(stop_backup_lsn_tmp, false, backup->tli,
-							false, true, WARNING, stream_wal);
+							 false, true, WARNING, stream_wal);
 
 				/* Get the first record in segment with current stop_lsn */
 				lsn_tmp = get_first_record_lsn(xlog_path, segno, backup->tli,
-										    instance_config.xlog_seg_size);
+										       instance_config.xlog_seg_size,
+										       instance_config.archive_timeout);
 
 				/* Check that returned LSN is valid and greater than stop_lsn */
 				if (XLogRecPtrIsInvalid(lsn_tmp) ||
 					!XRecOffIsValid(lsn_tmp) ||
 					lsn_tmp < stop_backup_lsn_tmp)
 				{
+					/* Backup from master should error out here */
+					if (!backup->from_replica)
+						elog(ERROR, "Failed to get next WAL record after %X/%X",
+									(uint32) (stop_backup_lsn_tmp >> 32),
+									(uint32) (stop_backup_lsn_tmp));
+
 					/* No luck, falling back to looking up for previous record */
 					elog(WARNING, "Failed to get next WAL record after %X/%X, "
 								"looking for previous WAL record",
@@ -1820,16 +1841,38 @@ pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
 									(uint32) (stop_backup_lsn_tmp >> 32),
 									(uint32) (stop_backup_lsn_tmp));
 				}
+			}
+			/* stop lsn is aligned to xlog block size, just find next lsn */
+			else if (stop_backup_lsn_tmp % XLOG_BLCKSZ == 0)
+			{
+				/* Wait for segment with current stop_lsn */
+				wait_wal_lsn(stop_backup_lsn_tmp, false, backup->tli,
+							 false, true, ERROR, stream_wal);
 
-				/* Setting stop_backup_lsn will set stop point for streaming */
-				stop_backup_lsn = lsn_tmp;
-				stop_lsn_exists = true;
+				/* Get the next closest record in segment with current stop_lsn */
+				lsn_tmp = get_next_record_lsn(xlog_path, segno, backup->tli,
+										       instance_config.xlog_seg_size,
+										       instance_config.archive_timeout,
+										       stop_backup_lsn_tmp);
+
+				/* sanity */
+				if (!XRecOffIsValid(lsn_tmp) || XLogRecPtrIsInvalid(lsn_tmp))
+					elog(ERROR, "Failed to get WAL record next to %X/%X",
+								(uint32) (stop_backup_lsn_tmp >> 32),
+								(uint32) (stop_backup_lsn_tmp));
 			}
 			/* PostgreSQL returned something very illegal as STOP_LSN, error out */
 			else
 				elog(ERROR, "Invalid stop_backup_lsn value %X/%X",
 					 (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
+
+			/* Setting stop_backup_lsn will set stop point for streaming */
+			stop_backup_lsn = lsn_tmp;
+			stop_lsn_exists = true;
 		}
+
+		elog(LOG, "stop_lsn: %X/%X",
+			(uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
 
 		/* Write backup_label and tablespace_map */
 		if (!exclusive_backup)
@@ -1864,8 +1907,6 @@ pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
 
 				file->write_size = file->size;
 				file->uncompressed_size = file->size;
-				free(file->path);
-				file->path = strdup(PG_BACKUP_LABEL_FILE);
 				parray_append(backup_files_list, file);
 			}
 		}
@@ -1912,8 +1953,7 @@ pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
 					file->crc = pgFileGetCRC(tablespace_map, true, false);
 					file->write_size = file->size;
 				}
-				free(file->path);
-				file->path = strdup(PG_TABLESPACE_MAP_FILE);
+
 				parray_append(backup_files_list, file);
 			}
 		}
@@ -2017,7 +2057,7 @@ backup_cleanup(bool fatal, void *userdata)
 			 base36enc(current.start_time));
 		current.end_time = time(NULL);
 		current.status = BACKUP_STATUS_ERROR;
-		write_backup(&current);
+		write_backup(&current, true);
 	}
 }
 
@@ -2054,15 +2094,15 @@ backup_files(void *arg)
 
 		if (arguments->thread_num == 1)
 		{
-			/* update backup_content.control every 10 seconds */
-			if ((difftime(time(NULL), prev_time)) > 10)
+			/* update backup_content.control every 60 seconds */
+			if ((difftime(time(NULL), prev_time)) > 60)
 			{
-				prev_time = time(NULL);
-
 				write_backup_filelist(&current, arguments->files_list, arguments->from_root,
-									  arguments->external_dirs);
+									  arguments->external_dirs, false);
 				/* update backup control file to update size info */
-				write_backup(&current);
+				write_backup(&current, true);
+
+				prev_time = time(NULL);
 			}
 		}
 
@@ -2134,7 +2174,7 @@ backup_files(void *arg)
 								 arguments->nodeInfo->checksum_version,
 								 arguments->nodeInfo->ptrack_version_num,
 								 arguments->nodeInfo->ptrack_schema,
-								 true);
+								 arguments->hdr_map, false);
 		}
 		else
 		{
@@ -2184,13 +2224,10 @@ parse_filelist_filenames(parray *files, const char *root)
 	while (i < parray_num(files))
 	{
 		pgFile	   *file = (pgFile *) parray_get(files, i);
-		char	   *relative;
 		int 		sscanf_result;
 
-		relative = GetRelativePath(file->path, root);
-
 		if (S_ISREG(file->mode) &&
-			path_is_prefix_of_path(PG_TBLSPC_DIR, relative))
+			path_is_prefix_of_path(PG_TBLSPC_DIR, file->rel_path))
 		{
 			/*
 			 * Found file in pg_tblspc/tblsOid/TABLESPACE_VERSION_DIRECTORY
@@ -2205,21 +2242,21 @@ parse_filelist_filenames(parray *files, const char *root)
 				 * Check that the file is located under
 				 * TABLESPACE_VERSION_DIRECTORY
 				 */
-				sscanf_result = sscanf(relative, PG_TBLSPC_DIR "/%u/%s/%u",
+				sscanf_result = sscanf(file->rel_path, PG_TBLSPC_DIR "/%u/%s/%u",
 									   &tblspcOid, tmp_rel_path, &dbOid);
 
 				/* Yes, it is */
 				if (sscanf_result == 2 &&
 					strncmp(tmp_rel_path, TABLESPACE_VERSION_DIRECTORY,
 							strlen(TABLESPACE_VERSION_DIRECTORY)) == 0)
-					set_cfs_datafiles(files, root, relative, i);
+					set_cfs_datafiles(files, root, file->rel_path, i);
 			}
 		}
 
 		if (S_ISREG(file->mode) && file->tblspcOid != 0 &&
 			file->name && file->name[0])
 		{
-			if (strcmp(file->forkName, "init") == 0)
+			if (file->forkName == init)
 			{
 				/*
 				 * Do not backup files of unlogged relations.
@@ -2270,7 +2307,6 @@ set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
 	int			p;
 	pgFile	   *prev_file;
 	char	   *cfs_tblspc_path;
-	char	   *relative_prev_file;
 
 	cfs_tblspc_path = strdup(relative);
 	if(!cfs_tblspc_path)
@@ -2282,22 +2318,21 @@ set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
 	for (p = (int) i; p >= 0; p--)
 	{
 		prev_file = (pgFile *) parray_get(files, (size_t) p);
-		relative_prev_file = GetRelativePath(prev_file->path, root);
 
-		elog(VERBOSE, "Checking file in cfs tablespace %s", relative_prev_file);
+		elog(VERBOSE, "Checking file in cfs tablespace %s", prev_file->rel_path);
 
-		if (strstr(relative_prev_file, cfs_tblspc_path) != NULL)
+		if (strstr(prev_file->rel_path, cfs_tblspc_path) != NULL)
 		{
 			if (S_ISREG(prev_file->mode) && prev_file->is_datafile)
 			{
 				elog(VERBOSE, "Setting 'is_cfs' on file %s, name %s",
-					relative_prev_file, prev_file->name);
+					prev_file->rel_path, prev_file->name);
 				prev_file->is_cfs = true;
 			}
 		}
 		else
 		{
-			elog(VERBOSE, "Breaking on %s", relative_prev_file);
+			elog(VERBOSE, "Breaking on %s", prev_file->rel_path);
 			break;
 		}
 	}
@@ -2311,7 +2346,7 @@ set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
 void
 process_block_change(ForkNumber forknum, RelFileNode rnode, BlockNumber blkno)
 {
-	char	   *path;
+//	char	   *path;
 	char	   *rel_path;
 	BlockNumber blkno_inseg;
 	int			segno;
@@ -2323,16 +2358,15 @@ process_block_change(ForkNumber forknum, RelFileNode rnode, BlockNumber blkno)
 
 	rel_path = relpathperm(rnode, forknum);
 	if (segno > 0)
-		path = psprintf("%s/%s.%u", instance_config.pgdata, rel_path, segno);
+		f.rel_path = psprintf("%s.%u", rel_path, segno);
 	else
-		path = psprintf("%s/%s", instance_config.pgdata, rel_path);
+		f.rel_path = rel_path;
 
-	pg_free(rel_path);
+	f.external_dir_num = 0;
 
-	f.path = path;
 	/* backup_files_list should be sorted before */
 	file_item = (pgFile **) parray_bsearch(backup_files_list, &f,
-										   pgFileComparePath);
+										   pgFileCompareRelPathWithExternal);
 
 	/*
 	 * If we don't have any record of this file in the file map, it means
@@ -2352,7 +2386,7 @@ process_block_change(ForkNumber forknum, RelFileNode rnode, BlockNumber blkno)
 			pthread_mutex_unlock(&backup_pagemap_mutex);
 	}
 
-	pg_free(path);
+	pg_free(rel_path);
 }
 
 /*
