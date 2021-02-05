@@ -39,19 +39,36 @@ typedef struct
 	int			ret;
 } restore_files_arg;
 
+
+static void
+print_recovery_settings(FILE *fp, pgBackup *backup,
+							   pgRestoreParams *params, pgRecoveryTarget *rt);
+static void
+print_standby_settings_common(FILE *fp, pgBackup *backup, pgRestoreParams *params);
+
+#if PG_VERSION_NUM >= 120000
+static void
+update_recovery_options(pgBackup *backup,
+						pgRestoreParams *params, pgRecoveryTarget *rt);
+#else
+static void
+update_recovery_options_before_v12(pgBackup *backup,
+								   pgRestoreParams *params, pgRecoveryTarget *rt);
+#endif
+
 static void create_recovery_conf(time_t backup_id,
 								 pgRecoveryTarget *rt,
 								 pgBackup *backup,
 								 pgRestoreParams *params);
 static void *restore_files(void *arg);
 static void set_orphan_status(parray *backups, pgBackup *parent_backup);
-static void pg12_recovery_config(pgBackup *backup, bool add_include);
 
 static void restore_chain(pgBackup *dest_backup, parray *parent_chain,
 						  parray *dbOid_exclude_list, pgRestoreParams *params,
-						  const char *pgdata_path, bool no_sync);
-static void check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
-											IncrRestoreMode incremental_mode);
+						  const char *pgdata_path, bool no_sync, bool cleanup_pgdata,
+						  bool backup_has_tblspc);
+static DestDirIncrCompatibility check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
+																IncrRestoreMode incremental_mode);
 
 /*
  * Iterate over backup list to find all ancestors of the broken parent_backup
@@ -115,38 +132,86 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 	parray	   *parent_chain = NULL;
 	parray	   *dbOid_exclude_list = NULL;
 	bool        pgdata_is_empty = true;
-	bool        tblspaces_are_empty = true;
+	bool        cleanup_pgdata = false;
+	bool        backup_has_tblspc = true; /* backup contain tablespace */
 	XLogRecPtr  shift_lsn = InvalidXLogRecPtr;
+
+	if (instance_name == NULL)
+		elog(ERROR, "required parameter not specified: --instance");
 
 	if (params->is_restore)
 	{
 		if (instance_config.pgdata == NULL)
 			elog(ERROR,
 				"required parameter not specified: PGDATA (-D, --pgdata)");
+
 		/* Check if restore destination empty */
 		if (!dir_is_empty(instance_config.pgdata, FIO_DB_HOST))
 		{
+			/* if destination directory is empty, then incremental restore may be disabled */
+			pgdata_is_empty = false;
+
 			/* Check that remote system is NOT running and systemd id is the same as ours */
 			if (params->incremental_mode != INCR_NONE)
 			{
+				DestDirIncrCompatibility rc;
+				bool ok_to_go = true;
+
 				elog(INFO, "Running incremental restore into nonempty directory: \"%s\"",
 					 instance_config.pgdata);
 
-				check_incremental_compatibility(instance_config.pgdata,
-												instance_config.system_identifier,
-												params->incremental_mode);
+				rc = check_incremental_compatibility(instance_config.pgdata,
+													 instance_config.system_identifier,
+													 params->incremental_mode);
+				if (rc == POSTMASTER_IS_RUNNING)
+				{
+					/* Even with force flag it is unwise to run
+					 * incremental restore over running instance
+					 */
+					ok_to_go = false;
+				}
+				else if (rc == SYSTEM_ID_MISMATCH)
+				{
+					/*
+					 * In force mode it is possible to ignore system id mismatch
+					 * by just wiping clean the destination directory.
+					 */
+					if (params->incremental_mode != INCR_NONE && params->force)
+						cleanup_pgdata = true;
+					else
+						ok_to_go = false;
+				}
+				else if (rc == BACKUP_LABEL_EXISTS)
+				{
+					/*
+					 * A big no-no for lsn-based incremental restore
+					 * If there is backup label in PGDATA, then this cluster was probably
+					 * restored from backup, but not started yet. Which means that values
+					 * in pg_control are not synchronized with PGDATA and so we cannot use
+					 * incremental restore in LSN mode, because it is relying on pg_control
+					 * to calculate switchpoint.
+					 */
+					if (params->incremental_mode == INCR_LSN)
+						ok_to_go = false;
+				}
+				else if (rc == DEST_IS_NOT_OK)
+				{
+					/*
+					 * Something else is wrong. For example, postmaster.pid is mangled,
+					 * so we cannot be sure that postmaster is running or not.
+					 * It is better to just error out.
+					 */
+					ok_to_go = false;
+				}
+
+				if (!ok_to_go)
+					elog(ERROR, "Incremental restore is not allowed");
 			}
 			else
 				elog(ERROR, "Restore destination is not empty: \"%s\"",
 					 instance_config.pgdata);
-
-			/* if destination directory is empty, then incremental restore may be disabled */
-			pgdata_is_empty = false;
 		}
 	}
-
-	if (instance_name == NULL)
-		elog(ERROR, "required parameter not specified: --instance");
 
 	elog(LOG, "%s begin.", action);
 
@@ -340,9 +405,15 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 	 */
 	if (params->is_restore)
 	{
-		check_tablespace_mapping(dest_backup, params->incremental_mode != INCR_NONE, &tblspaces_are_empty);
+		int rc = check_tablespace_mapping(dest_backup,
+										  params->incremental_mode != INCR_NONE, params->force,
+										  pgdata_is_empty);
 
-		if (params->incremental_mode != INCR_NONE && pgdata_is_empty && tblspaces_are_empty)
+		/* backup contain no tablespaces */
+		if (rc == NoTblspc)
+			backup_has_tblspc = false;
+
+		if (params->incremental_mode != INCR_NONE && !cleanup_pgdata && pgdata_is_empty && (rc != NotEmptyTblspc))
 		{
 			elog(INFO, "Destination directory and tablespace directories are empty, "
 					"disable incremental restore");
@@ -350,6 +421,9 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 		}
 
 		/* no point in checking external directories if their restore is not requested */
+		//TODO:
+		//		- make check_external_dir_mapping more like check_tablespace_mapping
+		//		- honor force flag in case of incremental restore just like check_tablespace_mapping
 		if (!params->skip_external_dirs)
 			check_external_dir_mapping(dest_backup, params->incremental_mode != INCR_NONE);
 	}
@@ -496,18 +570,11 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 		{
 			tmp_backup = (pgBackup *) parray_get(parent_chain, i);
 
-			/* Do not interrupt, validate the next backup */
-			if (!lock_backup(tmp_backup, true))
+			/* lock every backup in chain in read-only mode */
+			if (!lock_backup(tmp_backup, true, false))
 			{
-				if (params->is_restore)
-					elog(ERROR, "Cannot lock backup %s directory",
-						 base36enc(tmp_backup->start_time));
-				else
-				{
-					elog(WARNING, "Cannot lock backup %s directory, skip validation",
-						 base36enc(tmp_backup->start_time));
-					continue;
-				}
+				elog(ERROR, "Cannot lock backup %s directory",
+					 base36enc(tmp_backup->start_time));
 			}
 
 			/* validate datafiles only */
@@ -601,9 +668,10 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 					 base36enc(dest_backup->start_time),
 					 dest_backup->server_version);
 
-		restore_chain(dest_backup, parent_chain, dbOid_exclude_list,
-							params, instance_config.pgdata, no_sync);
+		restore_chain(dest_backup, parent_chain, dbOid_exclude_list, params,
+					  instance_config.pgdata, no_sync, cleanup_pgdata, backup_has_tblspc);
 
+		//TODO rename and update comment
 		/* Create recovery.conf with given recovery target parameters */
 		create_recovery_conf(target_backup_id, rt, dest_backup, params);
 	}
@@ -624,11 +692,13 @@ do_restore_or_validate(time_t target_backup_id, pgRecoveryTarget *rt,
 
 /*
  * Restore backup chain.
+ * Flag 'cleanup_pgdata' demands the removing of already existing content in PGDATA.
  */
 void
 restore_chain(pgBackup *dest_backup, parray *parent_chain,
 			  parray *dbOid_exclude_list, pgRestoreParams *params,
-			  const char *pgdata_path, bool no_sync)
+			  const char *pgdata_path, bool no_sync, bool cleanup_pgdata,
+			  bool backup_has_tblspc)
 {
 	int			i;
 	char		timestamp[100];
@@ -650,7 +720,7 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 	time_t		start_time, end_time;
 
 	/* Preparations for actual restoring */
-	time2iso(timestamp, lengthof(timestamp), dest_backup->start_time);
+	time2iso(timestamp, lengthof(timestamp), dest_backup->start_time, false);
 	elog(INFO, "Restoring the database from backup at %s", timestamp);
 
 	dest_files = get_backup_filelist(dest_backup, true);
@@ -660,7 +730,7 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 	{
 		pgBackup   *backup = (pgBackup *) parray_get(parent_chain, i);
 
-		if (!lock_backup(backup, true))
+		if (!lock_backup(backup, true, false))
 			elog(ERROR, "Cannot lock backup %s", base36enc(backup->start_time));
 
 		if (backup->status != BACKUP_STATUS_OK &&
@@ -726,7 +796,7 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 	 * Restore dest_backup internal directories.
 	 */
 	create_data_directories(dest_files, instance_config.pgdata,
-							dest_backup->root_dir, true,
+							dest_backup->root_dir, backup_has_tblspc,
 							params->incremental_mode != INCR_NONE,
 							FIO_DB_HOST);
 
@@ -779,18 +849,24 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 	}
 
 	/* Get list of files in destination directory and remove redundant files */
-	if (params->incremental_mode != INCR_NONE)
+	if (params->incremental_mode != INCR_NONE || cleanup_pgdata)
 	{
 		pgdata_files = parray_new();
 
 		elog(INFO, "Extracting the content of destination directory for incremental restore");
 
 		time(&start_time);
-		if (fio_is_remote(FIO_DB_HOST))
-			fio_list_dir(pgdata_files, pgdata_path, false, true, false, false, true, 0);
-		else
-			dir_list_file(pgdata_files, pgdata_path,
-						  false, true, false, false, true, 0, FIO_LOCAL_HOST);
+		fio_list_dir(pgdata_files, pgdata_path, false, true, false, false, true, 0);
+
+		/*
+		 * TODO:
+		 * 1. Currently we are cleaning the tablespaces in check_tablespace_mapping and PGDATA here.
+		 *    It would be great to do all this work in one place.
+		 * 
+		 * 2. In case of tablespace remapping we do not cleanup the old tablespace path,
+		 *    it is just left as it is.
+		 *    Lookup tests.incr_restore.IncrRestoreTest.test_incr_restore_with_tablespace_5
+		 */
 
 		/* get external dirs content */
 		if (external_dirs)
@@ -800,13 +876,8 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 				char *external_path = parray_get(external_dirs, i);
 				parray	*external_files = parray_new();
 
-				if (fio_is_remote(FIO_DB_HOST))
-					fio_list_dir(external_files, external_path,
-								 false, true, false, false, true, i+1);
-				else
-					dir_list_file(external_files, external_path,
-								  false, true, false, false, true, i+1,
-								  FIO_LOCAL_HOST);
+				fio_list_dir(external_files, external_path,
+							 false, true, false, false, true, i+1);
 
 				parray_concat(pgdata_files, external_files);
 				parray_free(external_files);
@@ -826,23 +897,39 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 		time(&start_time);
 		for (i = 0; i < parray_num(pgdata_files); i++)
 		{
-			pgFile	   *file = (pgFile *) parray_get(pgdata_files, i);
+			bool     redundant = true;
+			pgFile	*file = (pgFile *) parray_get(pgdata_files, i);
+
+			if (parray_bsearch(dest_backup->files, file, pgFileCompareRelPathWithExternal))
+				redundant = false;
+
+			/* do not delete the useful internal directories */
+			if (S_ISDIR(file->mode) && !redundant)
+				continue;
 
 			/* if file does not exists in destination list, then we can safely unlink it */
-			if (parray_bsearch(dest_backup->files, file, pgFileCompareRelPathWithExternal) == NULL)
+			if (cleanup_pgdata || redundant)
 			{
 				char		fullpath[MAXPGPATH];
 
 				join_path_components(fullpath, pgdata_path, file->rel_path);
 
-//				fio_pgFileDelete(file, full_file_path);
 				fio_delete(file->mode, fullpath, FIO_DB_HOST);
 				elog(VERBOSE, "Deleted file \"%s\"", fullpath);
 
 				/* shrink pgdata list */
+				pgFileFree(file);
 				parray_remove(pgdata_files, i);
 				i--;
 			}
+		}
+
+		if (cleanup_pgdata)
+		{
+			/* Destination PGDATA and tablespaces were cleaned up, so it's the regular restore from this point */
+			params->incremental_mode = INCR_NONE;
+			parray_free(pgdata_files);
+			pgdata_files = NULL;
 		}
 
 		time(&end_time);
@@ -1022,6 +1109,7 @@ restore_files(void *arg)
 		bool     already_exists = false;
 		PageState      *checksum_map = NULL; /* it should take ~1.5MB at most */
 		datapagemap_t  *lsn_map = NULL;      /* it should take 16kB at most */
+		char           *errmsg = NULL;       /* remote agent error message */
 		pgFile	*dest_file = (pgFile *) parray_get(arguments->dest_files, i);
 
 		/* Directories were created before */
@@ -1175,6 +1263,10 @@ restore_files(void *arg)
 		}
 
 done:
+		/* Writing is asynchronous in case of restore in remote mode, so check the agent status */
+		if (fio_check_error_file(out, &errmsg))
+			elog(ERROR, "Cannot write to the remote file \"%s\": %s", to_fullpath, errmsg);
+
 		/* close file */
 		if (fio_fclose(out) != 0)
 			elog(ERROR, "Cannot close file \"%s\": %s", to_fullpath,
@@ -1202,7 +1294,7 @@ done:
 }
 
 /*
- * Create recovery.conf (probackup_recovery.conf in case of PG12)
+ * Create recovery.conf (postgresql.auto.conf in case of PG12)
  * with given recovery target parameters
  */
 static void
@@ -1211,13 +1303,9 @@ create_recovery_conf(time_t backup_id,
 					 pgBackup *backup,
 					 pgRestoreParams *params)
 {
-	char		path[MAXPGPATH];
-	FILE	   *fp;
-	bool		pitr_requested;
 	bool		target_latest;
 	bool		target_immediate;
 	bool 		restore_command_provided = false;
-	char restore_command_guc[16384];
 
 	if (instance_config.restore_command &&
 		(pg_strcasecmp(instance_config.restore_command, "none") != 0))
@@ -1249,36 +1337,142 @@ create_recovery_conf(time_t backup_id,
 	 * We will get a replica that is "in the future" to the master.
 	 * We accept this risk because its probability is low.
 	 */
-	pitr_requested = !backup->stream || rt->time_string ||
+	if (!backup->stream || rt->time_string ||
 		rt->xid_string || rt->lsn_string || rt->target_name ||
-		target_immediate || target_latest || restore_command_provided;
+		target_immediate || target_latest || restore_command_provided)
+		params->recovery_settings_mode = PITR_REQUESTED;
 
-	/* No need to generate recovery.conf at all. */
-	if (!(pitr_requested || params->restore_as_replica))
+	elog(LOG, "----------------------------------------");
+
+#if PG_VERSION_NUM >= 120000
+	update_recovery_options(backup, params, rt);
+#else
+	update_recovery_options_before_v12(backup, params, rt);
+#endif
+}
+
+
+/* TODO get rid of using global variables: instance_config, backup_path, instance_name */
+static void
+print_recovery_settings(FILE *fp, pgBackup *backup,
+							   pgRestoreParams *params, pgRecoveryTarget *rt)
+{
+	char restore_command_guc[16384];
+	fio_fprintf(fp, "## recovery settings\n");
+
+	/* If restore_command is provided, use it. Otherwise construct it from scratch. */
+	if (instance_config.restore_command &&
+		(pg_strcasecmp(instance_config.restore_command, "none") != 0))
+		sprintf(restore_command_guc, "%s", instance_config.restore_command);
+	else
 	{
-		/*
-		 * Restoring STREAM backup without PITR and not as replica,
-		 * recovery.signal and standby.signal for PG12 are not needed
-		 *
-		 * We do not add "include" option in this case because
-		 * here we are creating empty "probackup_recovery.conf"
-		 * to handle possible already existing "include"
-		 * directive pointing to "probackup_recovery.conf".
-		 * If don`t do that, recovery will fail.
-		 */
-		pg12_recovery_config(backup, false);
+		/* default cmdline, ok for local restore */
+		sprintf(restore_command_guc, "%s archive-get -B %s --instance %s "
+				"--wal-file-path=%%p --wal-file-name=%%f",
+				PROGRAM_FULL_PATH ? PROGRAM_FULL_PATH : PROGRAM_NAME,
+				backup_path, instance_name);
+
+		/* append --remote-* parameters provided via --archive-* settings */
+		if (instance_config.archive.host)
+		{
+			strcat(restore_command_guc, " --remote-host=");
+			strcat(restore_command_guc, instance_config.archive.host);
+		}
+
+		if (instance_config.archive.port)
+		{
+			strcat(restore_command_guc, " --remote-port=");
+			strcat(restore_command_guc, instance_config.archive.port);
+		}
+
+		if (instance_config.archive.user)
+		{
+			strcat(restore_command_guc, " --remote-user=");
+			strcat(restore_command_guc, instance_config.archive.user);
+		}
+	}
+
+	/*
+	 * We've already checked that only one of the four following mutually
+	 * exclusive options is specified, so the order of calls is insignificant.
+	 */
+	if (rt->target_name)
+		fio_fprintf(fp, "recovery_target_name = '%s'\n", rt->target_name);
+
+	if (rt->time_string)
+		fio_fprintf(fp, "recovery_target_time = '%s'\n", rt->time_string);
+
+	if (rt->xid_string)
+		fio_fprintf(fp, "recovery_target_xid = '%s'\n", rt->xid_string);
+
+	if (rt->lsn_string)
+		fio_fprintf(fp, "recovery_target_lsn = '%s'\n", rt->lsn_string);
+
+	if (rt->target_stop && (strcmp(rt->target_stop, "immediate") == 0))
+		fio_fprintf(fp, "recovery_target = '%s'\n", rt->target_stop);
+
+	if (rt->inclusive_specified)
+		fio_fprintf(fp, "recovery_target_inclusive = '%s'\n",
+				rt->target_inclusive ? "true" : "false");
+
+	if (rt->target_tli)
+		fio_fprintf(fp, "recovery_target_timeline = '%u'\n", rt->target_tli);
+	else
+	{
+#if PG_VERSION_NUM >= 120000
+
+			/*
+			 * In PG12 default recovery target timeline was changed to 'latest', which
+			 * is extremely risky. Explicitly preserve old behavior of recovering to current
+			 * timneline for PG12.
+			 */
+			fio_fprintf(fp, "recovery_target_timeline = 'current'\n");
+#endif
+	}
+
+	if (rt->target_action)
+		fio_fprintf(fp, "recovery_target_action = '%s'\n", rt->target_action);
+	else
+		/* default recovery_target_action is 'pause' */
+		fio_fprintf(fp, "recovery_target_action = '%s'\n", "pause");
+
+	elog(LOG, "Setting restore_command to '%s'", restore_command_guc);
+	fio_fprintf(fp, "restore_command = '%s'\n", restore_command_guc);
+}
+
+static void
+print_standby_settings_common(FILE *fp, pgBackup *backup, pgRestoreParams *params)
+{
+	fio_fprintf(fp, "\n## standby settings\n");
+	if (params->primary_conninfo)
+		fio_fprintf(fp, "primary_conninfo = '%s'\n", params->primary_conninfo);
+	else if (backup->primary_conninfo)
+		fio_fprintf(fp, "primary_conninfo = '%s'\n", backup->primary_conninfo);
+
+	if (params->primary_slot_name != NULL)
+		fio_fprintf(fp, "primary_slot_name = '%s'\n", params->primary_slot_name);
+}
+
+#if PG_VERSION_NUM < 120000
+static void
+update_recovery_options_before_v12(pgBackup *backup,
+								   pgRestoreParams *params, pgRecoveryTarget *rt)
+{
+	FILE	   *fp;
+	char		path[MAXPGPATH];
+
+	/*
+	 * If PITR is not requested and instance is not restored as replica,
+	 * then recovery.conf should not be created.
+	 */
+	if (params->recovery_settings_mode != PITR_REQUESTED &&
+		!params->restore_as_replica)
+	{
 		return;
 	}
 
-	elog(LOG, "----------------------------------------");
-#if PG_VERSION_NUM >= 120000
-	elog(LOG, "creating probackup_recovery.conf");
-	pg12_recovery_config(backup, true);
-	snprintf(path, lengthof(path), "%s/probackup_recovery.conf", instance_config.pgdata);
-#else
-	elog(LOG, "creating recovery.conf");
+	elog(LOG, "update recovery settings in recovery.conf");
 	snprintf(path, lengthof(path), "%s/recovery.conf", instance_config.pgdata);
-#endif
 
 	fp = fio_fopen(path, "w", FIO_DB_HOST);
 	if (fp == NULL)
@@ -1288,226 +1482,194 @@ create_recovery_conf(time_t backup_id,
 	if (fio_chmod(path, FILE_PERMISSION, FIO_DB_HOST) == -1)
 		elog(ERROR, "Cannot change mode of \"%s\": %s", path, strerror(errno));
 
-#if PG_VERSION_NUM >= 120000
-	fio_fprintf(fp, "# probackup_recovery.conf generated by pg_probackup %s\n",
-				PROGRAM_VERSION);
-#else
 	fio_fprintf(fp, "# recovery.conf generated by pg_probackup %s\n",
 				PROGRAM_VERSION);
-#endif
 
-	/* construct restore_command */
-	if (pitr_requested)
-	{
-		fio_fprintf(fp, "\n## recovery settings\n");
-		/* If restore_command is provided, use it. Otherwise construct it from scratch. */
-		if (restore_command_provided)
-			sprintf(restore_command_guc, "%s", instance_config.restore_command);
-		else
-		{
-			/* default cmdline, ok for local restore */
-			sprintf(restore_command_guc, "%s archive-get -B %s --instance %s "
-					"--wal-file-path=%%p --wal-file-name=%%f",
-					PROGRAM_FULL_PATH ? PROGRAM_FULL_PATH : PROGRAM_NAME,
-					backup_path, instance_name);
-
-			/* append --remote-* parameters provided via --archive-* settings */
-			if (instance_config.archive.host)
-			{
-				strcat(restore_command_guc, " --remote-host=");
-				strcat(restore_command_guc, instance_config.archive.host);
-			}
-
-			if (instance_config.archive.port)
-			{
-				strcat(restore_command_guc, " --remote-port=");
-				strcat(restore_command_guc, instance_config.archive.port);
-			}
-
-			if (instance_config.archive.user)
-			{
-				strcat(restore_command_guc, " --remote-user=");
-				strcat(restore_command_guc, instance_config.archive.user);
-			}
-		}
-
-		/*
-		 * We've already checked that only one of the four following mutually
-		 * exclusive options is specified, so the order of calls is insignificant.
-		 */
-		if (rt->target_name)
-			fio_fprintf(fp, "recovery_target_name = '%s'\n", rt->target_name);
-
-		if (rt->time_string)
-			fio_fprintf(fp, "recovery_target_time = '%s'\n", rt->time_string);
-
-		if (rt->xid_string)
-			fio_fprintf(fp, "recovery_target_xid = '%s'\n", rt->xid_string);
-
-		if (rt->lsn_string)
-			fio_fprintf(fp, "recovery_target_lsn = '%s'\n", rt->lsn_string);
-
-		if (rt->target_stop && target_immediate)
-			fio_fprintf(fp, "recovery_target = '%s'\n", rt->target_stop);
-
-		if (rt->inclusive_specified)
-			fio_fprintf(fp, "recovery_target_inclusive = '%s'\n",
-					rt->target_inclusive ? "true" : "false");
-
-		if (rt->target_tli)
-			fio_fprintf(fp, "recovery_target_timeline = '%u'\n", rt->target_tli);
-		else
-		{
-			/*
-			 * In PG12 default recovery target timeline was changed to 'latest', which
-			 * is extremely risky. Explicitly preserve old behavior of recovering to current
-			 * timneline for PG12.
-			 */
-#if PG_VERSION_NUM >= 120000
-			fio_fprintf(fp, "recovery_target_timeline = 'current'\n");
-#endif
-		}
-
-		if (rt->target_action)
-			fio_fprintf(fp, "recovery_target_action = '%s'\n", rt->target_action);
-		else
-			/* default recovery_target_action is 'pause' */
-			fio_fprintf(fp, "recovery_target_action = '%s'\n", "pause");
-	}
-
-	if (pitr_requested)
-	{
-		elog(LOG, "Setting restore_command to '%s'", restore_command_guc);
-		fio_fprintf(fp, "restore_command = '%s'\n", restore_command_guc);
-	}
+	if (params->recovery_settings_mode == PITR_REQUESTED)
+		print_recovery_settings(fp, backup, params, rt);
 
 	if (params->restore_as_replica)
 	{
-		fio_fprintf(fp, "\n## standby settings\n");
-	/* standby_mode was removed in PG12 */
-#if PG_VERSION_NUM < 120000
+		print_standby_settings_common(fp, backup, params);
 		fio_fprintf(fp, "standby_mode = 'on'\n");
-#endif
-
-		if (params->primary_conninfo)
-			fio_fprintf(fp, "primary_conninfo = '%s'\n", params->primary_conninfo);
-		else if (backup->primary_conninfo)
-			fio_fprintf(fp, "primary_conninfo = '%s'\n", backup->primary_conninfo);
-
-		if (params->primary_slot_name != NULL)
-			fio_fprintf(fp, "primary_slot_name = '%s'\n", params->primary_slot_name);
 	}
 
 	if (fio_fflush(fp) != 0 ||
 		fio_fclose(fp))
 		elog(ERROR, "cannot write file \"%s\": %s", path,
 			 strerror(errno));
-
-#if PG_VERSION_NUM >= 120000
-	/*
-	 * Create "recovery.signal" to mark this recovery as PITR for PostgreSQL.
-	 * In older versions presense of recovery.conf alone was enough.
-	 * To keep behaviour consistent with older versions,
-	 * we are forced to create "recovery.signal"
-	 * even when only restore_command is provided.
-	 * Presense of "recovery.signal" by itself determine only
-	 * one thing: do PostgreSQL must switch to a new timeline
-	 * after successfull recovery or not?
-	 */
-	if (pitr_requested)
-	{
-		elog(LOG, "creating recovery.signal file");
-		snprintf(path, lengthof(path), "%s/recovery.signal", instance_config.pgdata);
-
-		fp = fio_fopen(path, "w", FIO_DB_HOST);
-		if (fp == NULL)
-			elog(ERROR, "cannot open file \"%s\": %s", path,
-				strerror(errno));
-
-		if (fio_fflush(fp) != 0 ||
-			fio_fclose(fp))
-			elog(ERROR, "cannot write file \"%s\": %s", path,
-				 strerror(errno));
-	}
-
-	if (params->restore_as_replica)
-	{
-		elog(LOG, "creating standby.signal file");
-		snprintf(path, lengthof(path), "%s/standby.signal", instance_config.pgdata);
-
-		fp = fio_fopen(path, "w", FIO_DB_HOST);
-		if (fp == NULL)
-			elog(ERROR, "cannot open file \"%s\": %s", path,
-				strerror(errno));
-
-		if (fio_fflush(fp) != 0 ||
-			fio_fclose(fp))
-			elog(ERROR, "cannot write file \"%s\": %s", path,
-				 strerror(errno));
-	}
-#endif
 }
+#endif
 
 /*
- * Create empty probackup_recovery.conf in PGDATA and
- * add "include" directive to postgresql.auto.conf
-
- * When restoring PG12 we always(!) must do this, even
- * when restoring STREAM backup without PITR or replica options
- * because restored instance may have been previously backed up
- * and restored again and user didn`t cleaned up postgresql.auto.conf.
-
- * So for recovery to work regardless of all this factors
- * we must always create empty probackup_recovery.conf file.
+ * Read postgresql.auto.conf, clean old recovery options,
+ * to avoid unexpected intersections.
+ * Write recovery options for this backup.
  */
-static void
-pg12_recovery_config(pgBackup *backup, bool add_include)
-{
 #if PG_VERSION_NUM >= 120000
-	char		probackup_recovery_path[MAXPGPATH];
+static void
+update_recovery_options(pgBackup *backup,
+						pgRestoreParams *params, pgRecoveryTarget *rt)
+
+{
 	char		postgres_auto_path[MAXPGPATH];
-	FILE	   *fp;
+	char		postgres_auto_path_tmp[MAXPGPATH];
+	char		path[MAXPGPATH];
+	FILE	   *fp = NULL;
+	FILE	   *fp_tmp = NULL;
+	struct stat st;
+	char		current_time_str[100];
+	/* postgresql.auto.conf parsing */
+	char		line[16384] = "\0";
+	char	   *buf = NULL;
+	int		    buf_len = 0;
+	int		    buf_len_max = 16384;
 
-	if (add_include)
+	elog(LOG, "update recovery settings in postgresql.auto.conf");
+
+	time2iso(current_time_str, lengthof(current_time_str), current_time, false);
+
+	snprintf(postgres_auto_path, lengthof(postgres_auto_path),
+				"%s/postgresql.auto.conf", instance_config.pgdata);
+
+	if (fio_stat(postgres_auto_path, &st, false, FIO_DB_HOST) < 0)
 	{
-		char		current_time_str[100];
+		/* file not found is not an error case */
+		if (errno != ENOENT)
+			elog(ERROR, "cannot stat file \"%s\": %s", postgres_auto_path,
+				 strerror(errno));
+	}
 
-		time2iso(current_time_str, lengthof(current_time_str), current_time);
+	/* Kludge for 0-sized postgresql.auto.conf file. TODO: make something more intelligent */
+	if (st.st_size > 0)
+	{
+		fp = fio_open_stream(postgres_auto_path, FIO_DB_HOST);
+		if (fp == NULL)
+			elog(ERROR, "cannot open \"%s\": %s", postgres_auto_path, strerror(errno));
+	}
 
-		snprintf(postgres_auto_path, lengthof(postgres_auto_path),
-					"%s/postgresql.auto.conf", instance_config.pgdata);
+	sprintf(postgres_auto_path_tmp, "%s.tmp", postgres_auto_path);
+	fp_tmp = fio_fopen(postgres_auto_path_tmp, "w", FIO_DB_HOST);
+	if (fp_tmp == NULL)
+		elog(ERROR, "cannot open \"%s\": %s", postgres_auto_path_tmp, strerror(errno));
 
+	while (fp && fgets(line, lengthof(line), fp))
+	{
+		/* ignore "include 'probackup_recovery.conf'" directive */
+		if (strstr(line, "include") &&
+			strstr(line, "probackup_recovery.conf"))
+		{
+			continue;
+		}
+
+		/* ignore already existing recovery options */
+		if (strstr(line, "restore_command") ||
+			strstr(line, "recovery_target"))
+		{
+			continue;
+		}
+
+		if (!buf)
+			buf = pgut_malloc(buf_len_max);
+
+		/* avoid buffer overflow */
+		if ((buf_len + strlen(line)) >= buf_len_max)
+		{
+			buf_len_max += (buf_len + strlen(line)) *2;
+			buf = pgut_realloc(buf, buf_len_max);
+		}
+
+		buf_len += snprintf(buf+buf_len, sizeof(line), "%s", line);
+	}
+
+	/* close input postgresql.auto.conf */
+	if (fp)
+		fio_close_stream(fp);
+
+	/* Write data to postgresql.auto.conf.tmp */
+	if (buf_len > 0 &&
+		(fio_fwrite(fp_tmp, buf, buf_len) != buf_len))
+			elog(ERROR, "Cannot write to \"%s\": %s",
+					postgres_auto_path_tmp, strerror(errno));
+
+	if (fio_fflush(fp_tmp) != 0 ||
+		fio_fclose(fp_tmp))
+			elog(ERROR, "Cannot write file \"%s\": %s", postgres_auto_path_tmp,
+				strerror(errno));
+	pg_free(buf);
+
+	if (fio_rename(postgres_auto_path_tmp, postgres_auto_path, FIO_DB_HOST) < 0)
+		elog(ERROR, "Cannot rename file \"%s\" to \"%s\": %s",
+					postgres_auto_path_tmp, postgres_auto_path, strerror(errno));
+
+	if (fio_chmod(postgres_auto_path, FILE_PERMISSION, FIO_DB_HOST) == -1)
+		elog(ERROR, "Cannot change mode of \"%s\": %s", postgres_auto_path, strerror(errno));
+
+	if (params)
+	{
 		fp = fio_fopen(postgres_auto_path, "a", FIO_DB_HOST);
 		if (fp == NULL)
-			elog(ERROR, "cannot write to file \"%s\": %s", postgres_auto_path,
+			elog(ERROR, "cannot open file \"%s\": %s", postgres_auto_path,
 				strerror(errno));
 
-		// TODO: check if include 'probackup_recovery.conf' already exists
-		fio_fprintf(fp, "\n# created by pg_probackup restore of backup %s at '%s'\n",
-			base36enc(backup->start_time), current_time_str);
-		fio_fprintf(fp, "include '%s'\n", "probackup_recovery.conf");
+		fio_fprintf(fp, "\n# recovery settings added by pg_probackup restore of backup %s at '%s'\n",
+				base36enc(backup->start_time), current_time_str);
+
+		if (params->recovery_settings_mode == PITR_REQUESTED)
+			print_recovery_settings(fp, backup, params, rt);
+
+		if (params->restore_as_replica)
+			print_standby_settings_common(fp, backup, params);
 
 		if (fio_fflush(fp) != 0 ||
 			fio_fclose(fp))
-			elog(ERROR, "cannot write to file \"%s\": %s", postgres_auto_path,
+			elog(ERROR, "cannot write file \"%s\": %s", postgres_auto_path,
 				strerror(errno));
+
+		/*
+		* Create "recovery.signal" to mark this recovery as PITR for PostgreSQL.
+		* In older versions presense of recovery.conf alone was enough.
+		* To keep behaviour consistent with older versions,
+		* we are forced to create "recovery.signal"
+		* even when only restore_command is provided.
+		* Presense of "recovery.signal" by itself determine only
+		* one thing: do PostgreSQL must switch to a new timeline
+		* after successfull recovery or not?
+		*/
+		if (params->recovery_settings_mode == PITR_REQUESTED)
+		{
+			elog(LOG, "creating recovery.signal file");
+			snprintf(path, lengthof(path), "%s/recovery.signal", instance_config.pgdata);
+
+			fp = fio_fopen(path, PG_BINARY_W, FIO_DB_HOST);
+			if (fp == NULL)
+				elog(ERROR, "cannot open file \"%s\": %s", path,
+					strerror(errno));
+
+			if (fio_fflush(fp) != 0 ||
+				fio_fclose(fp))
+				elog(ERROR, "cannot write file \"%s\": %s", path,
+					strerror(errno));
+		}
+
+		if (params->restore_as_replica)
+		{
+			elog(LOG, "creating standby.signal file");
+			snprintf(path, lengthof(path), "%s/standby.signal", instance_config.pgdata);
+
+			fp = fio_fopen(path, PG_BINARY_W, FIO_DB_HOST);
+			if (fp == NULL)
+				elog(ERROR, "cannot open file \"%s\": %s", path,
+					strerror(errno));
+
+			if (fio_fflush(fp) != 0 ||
+				fio_fclose(fp))
+				elog(ERROR, "cannot write file \"%s\": %s", path,
+					strerror(errno));
+		}
 	}
-
-	/* Create empty probackup_recovery.conf */
-	snprintf(probackup_recovery_path, lengthof(probackup_recovery_path),
-		"%s/probackup_recovery.conf", instance_config.pgdata);
-	fp = fio_fopen(probackup_recovery_path, "w", FIO_DB_HOST);
-	if (fp == NULL)
-		elog(ERROR, "cannot open file \"%s\": %s", probackup_recovery_path,
-			strerror(errno));
-
-	if (fio_fflush(fp) != 0 ||
-		fio_fclose(fp))
-		elog(ERROR, "cannot write to file \"%s\": %s", probackup_recovery_path,
-			 strerror(errno));
-#endif
-	return;
 }
+#endif
 
 /*
  * Try to read a timeline's history file.
@@ -1959,35 +2121,20 @@ get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 
 /* Check that instance is suitable for incremental restore
  * Depending on type of incremental restore requirements are differs.
+ *
+ * TODO: add PG_CONTROL_IS_MISSING
  */
-void
+DestDirIncrCompatibility
 check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
 								IncrRestoreMode incremental_mode)
 {
 	uint64	system_id_pgdata;
+	bool    system_id_match = false;
 	bool    success = true;
+	bool    postmaster_is_up = false;
+	bool    backup_label_exists = false;
 	pid_t   pid;
 	char    backup_label[MAXPGPATH];
-
-	/* slurp pg_control and check that system ID is the same */
-	/* check that instance is not running */
-	/* if lsn_based, check that there is no backup_label files is around AND
-	 * get redo point lsn from destination pg_control.
-
-	 * It is really important to be sure that pg_control is in cohesion with
-	 * data files content, because based on pg_control information we will
-	 * choose a backup suitable for lsn based incremental restore.
-	 */
-
-	system_id_pgdata = get_system_identifier(pgdata);
-
-	if (system_id_pgdata != instance_config.system_identifier)
-	{
-		elog(WARNING, "Backup catalog was initialized for system id %lu, "
-					"but destination directory system id is %lu",
-					system_identifier, system_id_pgdata);
-		success = false;
-	}
 
 	/* check postmaster pid */
 	pid = fio_check_postmaster(pgdata, FIO_DB_HOST);
@@ -2006,7 +2153,27 @@ check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
 		elog(WARNING, "Postmaster with pid %u is running in destination directory \"%s\"",
 			pid, pgdata);
 		success = false;
+		postmaster_is_up = true;
 	}
+
+	/* slurp pg_control and check that system ID is the same
+	 * check that instance is not running
+	 * if lsn_based, check that there is no backup_label files is around AND
+	 * get redo point lsn from destination pg_control.
+
+	 * It is really important to be sure that pg_control is in cohesion with
+	 * data files content, because based on pg_control information we will
+	 * choose a backup suitable for lsn based incremental restore.
+	 */
+
+	system_id_pgdata = get_system_identifier(pgdata);
+
+	if (system_id_pgdata == instance_config.system_identifier)
+		system_id_match = true;
+	else
+		elog(WARNING, "Backup catalog was initialized for system id %lu, "
+					"but destination directory system id is %lu",
+					system_identifier, system_id_pgdata);
 
 	/*
 	 * TODO: maybe there should be some other signs, pointing to pg_control
@@ -2023,9 +2190,22 @@ check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
 				"to cluster with pg_control not synchronized with cluster state."
 				"Consider to use incremental restore in 'checksum' mode");
 			success = false;
+			backup_label_exists = true;
 		}
 	}
 
+	if (postmaster_is_up)
+		return POSTMASTER_IS_RUNNING;
+
+	if (!system_id_match)
+		return SYSTEM_ID_MISMATCH;
+
+	if (backup_label_exists)
+		return BACKUP_LABEL_EXISTS;
+
+	/* some other error condition */
 	if (!success)
-		elog(ERROR, "Incremental restore is impossible");
+		return DEST_IS_NOT_OK;
+
+	return DEST_OK;
 }

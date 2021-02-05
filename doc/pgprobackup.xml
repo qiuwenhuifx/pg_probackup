@@ -1206,18 +1206,6 @@ CREATE EXTENSION ptrack;
        does not affect PTRACK operation. The maximum allowed value is 1024.
       </para>
      </listitem>
-     <listitem>
-      <para>
-       Grant the right to execute <application>PTRACK</application>
-       functions to the <literal>backup</literal> role
-       in the database used to connect to the cluster:
-      </para>
-      <programlisting>
-GRANT EXECUTE ON FUNCTION pg_ptrack_get_pagemapset(pg_lsn) TO backup;
-GRANT EXECUTE ON FUNCTION pg_ptrack_control_lsn() TO backup;
-GRANT EXECUTE ON FUNCTION pg_ptrack_get_block(oid, oid, oid, bigint) TO backup;
-</programlisting>
-      </listitem>
     </orderedlist>
 
    <note>
@@ -1254,7 +1242,6 @@ GRANT EXECUTE ON FUNCTION pg_ptrack_get_block(oid, oid, oid, bigint) TO backup;
         <programlisting>
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_ptrack_clear() TO backup;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_ptrack_get_and_clear(oid, oid) TO backup;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_stop_backup() TO backup;
 </programlisting>
       </listitem>
     </orderedlist>
@@ -1874,10 +1861,25 @@ pg_probackup restore -B <replaceable>backup_dir</replaceable> --instance <replac
         you must drop the excluded databases using
         <command>DROP DATABASE</command> command.
       </para>
+      <para>
+        To decouple a single cluster containing multiple databases into separate clusters with minimal downtime,
+        you can do partial restore of the cluster as a standby using the <option>--restore-as-replica</option> option
+        for specific databases.
+      </para>
       <note>
         <para>
           The <literal>template0</literal> and
           <literal>template1</literal> databases are always restored.
+        </para>
+      </note>
+      <note>
+        <para>
+          Due to recovery specifics of PostgreSQL versions earlier than 12,
+          it is advisable that you set the
+          <ulink url="https://postgrespro.com/docs/postgresql/current/runtime-config-replication.html#GUC-HOT-STANDBY">hot_standby</ulink>
+          parameter to <literal>off</literal> when running partial
+          restore of a PostgreSQL cluster of version earlier than 12.
+          Otherwise the recovery may fail.
         </para>
       </note>
     </refsect3>
@@ -3964,6 +3966,11 @@ pg_probackup restore -B <replaceable>backup_dir</replaceable> --instance <replac
         this flag if you need to restore the
         <productname>PostgreSQL</productname> cluster from a corrupt or an invalid backup.
         Use with caution.
+        If <envar>PGDATA</envar> contains a non-empty directory with system ID different from that
+        of the backup being restored, <link linkend="pbk-incremental-restore">incremental restore</link>
+        with this flag overwrites the directory contents (while an error occurs without the flag). If tablespaces
+        are remapped through the <literal>--tablespace-mapping</literal> option into non-empty directories,
+        the contents of such directories will be deleted.
       </para>
       </listitem>
       </varlistentry>
@@ -4409,6 +4416,10 @@ pg_probackup archive-get -B <replaceable>backup_dir</replaceable> --instance <re
       <listitem>
       <para>
         Specifies the timestamp up to which recovery will proceed.
+        If the time zone offset is not specified, the local time zone is used.
+      </para>
+      <para>
+       Example: <literal>--recovery-target-time='2020-01-01 00:00:00+03'</literal>
       </para>
       </listitem>
       </varlistentry>
@@ -4595,6 +4606,7 @@ pg_probackup archive-get -B <replaceable>backup_dir</replaceable> --instance <re
       <para>
           Specifies the timestamp up to which the backup will stay
           pinned. Must be an ISO-8601 complaint timestamp.
+          If the time zone offset is not specified, the local time zone is used.
       </para>
       <para>
        Example: <literal>--expire-time='2020-01-01 00:00:00+03'</literal>
