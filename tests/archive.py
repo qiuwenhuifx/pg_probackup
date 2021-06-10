@@ -903,7 +903,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             initdb_params=['--data-checksums'],
             pg_options={
                 'checkpoint_timeout': '30s',
-                'autovacuum': 'off',
                 'archive_timeout': '10s'})
 
         replica = self.make_simple_node(
@@ -981,7 +980,90 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         self.backup_node(backup_dir, 'master', replica)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, nodes=[master, replica])
+        self.del_test_dir(module_name, fname)
+
+
+    # @unittest.expectedFailure
+    # @unittest.skip("skip")
+    def test_concurrent_archiving(self):
+        """
+        Concurrent archiving from master, replica and cascade replica
+        https://github.com/postgrespro/pg_probackup/issues/327
+
+        For PG >= 11 it is expected to pass this test
+        """
+
+        if self.pg_config_version < self.version_to_num('11.0'):
+            return unittest.skip('You need PostgreSQL >= 11 for this test')
+
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        master = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'master'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', master)
+        self.set_archiving(backup_dir, 'node', master, replica=True)
+        master.slow_start()
+
+        master.pgbench_init(scale=10)
+
+        # TAKE FULL ARCHIVE BACKUP FROM MASTER
+        self.backup_node(backup_dir, 'node', master)
+
+        # Settings for Replica
+        replica = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'replica'))
+        replica.cleanup()
+        self.restore_node(backup_dir, 'node', replica)
+
+        self.set_replica(master, replica, synchronous=True)
+        self.set_archiving(backup_dir, 'node', replica, replica=True)
+        self.set_auto_conf(replica, {'port': replica.port})
+        replica.slow_start(replica=True)
+
+        # create cascade replicas
+        replica1 = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'replica1'))
+        replica1.cleanup()
+
+        # Settings for casaced replica
+        self.restore_node(backup_dir, 'node', replica1)
+        self.set_replica(replica, replica1, synchronous=False)
+        self.set_auto_conf(replica1, {'port': replica1.port})
+        replica1.slow_start(replica=True)
+
+        # Take full backup from master
+        self.backup_node(backup_dir, 'node', master)
+
+        pgbench = master.pgbench(
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            options=['-T', '30', '-c', '1'])
+
+        # Take several incremental backups from master
+        self.backup_node(backup_dir, 'node', master, backup_type='page', options=['--no-validate'])
+
+        self.backup_node(backup_dir, 'node', master, backup_type='page', options=['--no-validate'])
+
+        pgbench.wait()
+        pgbench.stdout.close()
+
+        with open(os.path.join(master.logs_dir, 'postgresql.log'), 'r') as f:
+            log_content = f.read()
+        self.assertNotIn('different checksum', log_content)
+
+        with open(os.path.join(replica.logs_dir, 'postgresql.log'), 'r') as f:
+            log_content = f.read()
+        self.assertNotIn('different checksum', log_content)
+
+        with open(os.path.join(replica1.logs_dir, 'postgresql.log'), 'r') as f:
+            log_content = f.read()
+        self.assertNotIn('different checksum', log_content)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
 
     # @unittest.expectedFailure
     # @unittest.skip("skip")
@@ -1151,8 +1233,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             initdb_params=['--data-checksums'],
             pg_options={
                 'archive_timeout': '30s',
-                'checkpoint_timeout': '30s',
-                'autovacuum': 'off'})
+                'checkpoint_timeout': '30s'})
 
         if self.get_version(master) < self.version_to_num('9.6.0'):
             self.del_test_dir(module_name, fname)
@@ -1474,8 +1555,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             initdb_params=['--data-checksums'],
             pg_options={
                 'archive_timeout': '30s',
-                'checkpoint_timeout': '30s',
-                'autovacuum': 'off'})
+                'checkpoint_timeout': '30s'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1530,8 +1610,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             initdb_params=['--data-checksums'],
             pg_options={
                 'archive_timeout': '30s',
-                'checkpoint_timeout': '30s',
-                'autovacuum': 'off'})
+                'checkpoint_timeout': '30s'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1631,7 +1710,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             recovery_content = f.read()
 
         self.assertIn(
-            "restore_command = '{0} archive-get -B {1} --instance {2} "
+            "restore_command = '\"{0}\" archive-get -B \"{1}\" --instance \"{2}\" "
             "--wal-file-path=%p --wal-file-name=%f --remote-host=localhost "
             "--remote-port=22 --remote-user={3}'".format(
                 self.probackup_path, backup_dir, 'node', self.user),
@@ -1698,7 +1777,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         self.restore_node(
             backup_dir, 'node', node,
             options=[
-                '--restore-command=none'.format(wal_dir),
+                '--restore-command=none',
                 '--archive-host=localhost1',
                 '--archive-port=23',
                 '--archive-user={0}'.format(self.user)
@@ -1708,7 +1787,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             recovery_content = f.read()
 
         self.assertIn(
-            "restore_command = '{0} archive-get -B {1} --instance {2} "
+            "restore_command = '\"{0}\" archive-get -B \"{1}\" --instance \"{2}\" "
             "--wal-file-path=%p --wal-file-name=%f --remote-host=localhost1 "
             "--remote-port=23 --remote-user={3}'".format(
                 self.probackup_path, backup_dir, 'node', self.user),
@@ -1727,8 +1806,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1791,7 +1869,6 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             initdb_params=['--data-checksums'],
             pg_options={
-                'autovacuum': 'off',
                 'checkpoint_timeout': '30s',
                 'max_wal_size': '64MB'})
 
@@ -1908,7 +1985,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         output = self.show_archive(
             backup_dir, 'node', as_json=False, as_text=True,
-            options=['--log-level-console=VERBOSE'])
+            options=['--log-level-console=INFO'])
 
         self.assertNotIn('WARNING', output)
 
@@ -1924,43 +2001,30 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'archive_timeout': '10s'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
 
         node.slow_start()
 
-        self.backup_node(backup_dir, 'node', node, options=['--stream'])
-
-        replica = self.make_simple_node(
-            base_dir=os.path.join(module_name, fname, 'replica'))
-        replica.cleanup()
-
-        self.restore_node(
-            backup_dir, 'node', replica, replica.data_dir, options=['-R'])
-        self.set_auto_conf(replica, {'port': replica.port})
-        self.set_replica(node, replica)
-
-        self.add_instance(backup_dir, 'replica', replica)
-        # self.set_archiving(backup_dir, 'replica', replica, replica=True)
-
-        replica.slow_start(replica=True)
-
-        if self.get_version(replica) < 100000:
+        if self.get_version(node) < 100000:
+            app_name = 'pg_receivexlog'
             pg_receivexlog_path = self.get_bin_path('pg_receivexlog')
         else:
+            app_name = 'pg_receivewal'
             pg_receivexlog_path = self.get_bin_path('pg_receivewal')
 
         cmdline = [
-            pg_receivexlog_path, '-p', str(replica.port), '--synchronous',
-            '-D', os.path.join(backup_dir, 'wal', 'replica')]
+            pg_receivexlog_path, '-p', str(node.port), '--synchronous',
+            '-D', os.path.join(backup_dir, 'wal', 'node')]
 
         if self.archive_compress and node.major_version >= 10:
             cmdline += ['-Z', '1']
 
-        pg_receivexlog = self.run_binary(cmdline, asynchronous=True)
+        env = self.test_env
+        env["PGAPPNAME"] = app_name
+        pg_receivexlog = self.run_binary(cmdline, asynchronous=True, env=env)
 
         if pg_receivexlog.returncode:
             self.assertFalse(
@@ -1968,8 +2032,12 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                 'Failed to start pg_receivexlog: {0}'.format(
                     pg_receivexlog.communicate()[1]))
 
+        self.set_auto_conf(node, {'synchronous_standby_names': app_name})
+        self.set_auto_conf(node, {'synchronous_commit': 'on'})
+        node.reload()
+
         # FULL
-        self.backup_node(backup_dir, 'replica', replica, options=['--stream'])
+        self.backup_node(backup_dir, 'node', node, options=['--stream'])
 
         node.safe_psql(
             "postgres",
@@ -1979,7 +2047,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         # PAGE
         self.backup_node(
-            backup_dir, 'replica', replica, backup_type='delta', options=['--stream'])
+            backup_dir, 'node', node, backup_type='page', options=['--stream'])
 
         node.safe_psql(
             "postgres",
@@ -1987,37 +2055,32 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             "md5(repeat(i::text,10))::tsvector as tsvector "
             "from generate_series(1000000,2000000) i")
 
+        pg_receivexlog.kill()
+
         node_restored = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node_restored'))
         node_restored.cleanup()
 
         self.restore_node(
-            backup_dir, 'replica', node_restored,
-            node_restored.data_dir, options=['--recovery-target=latest', '--recovery-target-action=promote'])
+            backup_dir, 'node', node_restored, node_restored.data_dir,
+            options=['--recovery-target=latest', '--recovery-target-action=promote'])
         self.set_auto_conf(node_restored, {'port': node_restored.port})
         self.set_auto_conf(node_restored, {'hot_standby': 'off'})
-
-        # it will set node_restored as warm standby.
-#        with open(os.path.join(node_restored.data_dir, "standby.signal"), 'w') as f:
-#            f.flush()
-#            f.close()
 
         node_restored.slow_start()
 
         result = node.safe_psql(
             "postgres",
-            "select sum(id) from t_heap")
+            "select sum(id) from t_heap").decode('utf-8').rstrip()
 
         result_new = node_restored.safe_psql(
             "postgres",
-            "select sum(id) from t_heap")
+            "select sum(id) from t_heap").decode('utf-8').rstrip()
 
         self.assertEqual(result, result_new)
 
         # Clean after yourself
-        pg_receivexlog.kill()
-        self.del_test_dir(
-            module_name, fname, [node, replica, node_restored])
+        self.del_test_dir(module_name, fname)
 
     @unittest.skip("skip")
     def test_multi_timeline_recovery_prefetching(self):
@@ -2027,8 +2090,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -2143,8 +2205,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         if self.get_version(node) < self.version_to_num('9.6.0'):
             self.del_test_dir(module_name, fname)
@@ -2181,7 +2242,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         restore_command += ' -j 2 --batch-size=10'
 
-        print(restore_command)
+        # print(restore_command)
 
         if node.major_version >= 12:
             self.set_auto_conf(replica, {'restore_command': restore_command})
@@ -2216,8 +2277,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -2298,7 +2358,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                 dst_file = os.path.join(replica.data_dir, wal_dir, 'pbk_prefetch', filename)
                 shutil.copyfile(src_file, dst_file)
 
-            print(dst_file)
+            # print(dst_file)
 
         # corrupt file
         if files[-2].endswith('.gz'):
@@ -2472,6 +2532,98 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             log_content)
 
         # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.expectedFailure
+    # @unittest.skip("skip")
+    def test_archive_empty_history_file(self):
+        """
+        https://github.com/postgrespro/pg_probackup/issues/326
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+
+        node.slow_start()
+        node.pgbench_init(scale=5)
+
+        # FULL
+        self.backup_node(backup_dir, 'node', node)
+
+        node.pgbench_init(scale=5)
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+                    '--recovery-target=latest',
+                    '--recovery-target-action=promote'])
+
+        # Node in timeline 2
+        node.slow_start()
+
+        node.pgbench_init(scale=5)
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+                    '--recovery-target=latest',
+                    '--recovery-target-timeline=2',
+                    '--recovery-target-action=promote'])
+
+        # Node in timeline 3
+        node.slow_start()
+
+        node.pgbench_init(scale=5)
+        node.cleanup()
+
+        self.restore_node(
+            backup_dir, 'node', node,
+            options=[
+                    '--recovery-target=latest',
+                    '--recovery-target-timeline=3',
+                    '--recovery-target-action=promote'])
+
+        # Node in timeline 4
+        node.slow_start()
+        node.pgbench_init(scale=5)
+
+        # Truncate history files
+        for tli in range(2, 5):
+            file = os.path.join(
+                backup_dir, 'wal', 'node', '0000000{0}.history'.format(tli))
+            with open(file, "w+") as f:
+                f.truncate()
+
+        timelines = self.show_archive(backup_dir, 'node', options=['--log-level-file=INFO'])
+
+        # check that all timelines has zero switchpoint
+        for timeline in timelines:
+            self.assertEqual(timeline['switchpoint'], '0/0')
+
+        log_file = os.path.join(backup_dir, 'log', 'pg_probackup.log')
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+        wal_dir = os.path.join(backup_dir, 'wal', 'node')
+
+        self.assertIn(
+            'WARNING: History file is corrupted or missing: "{0}"'.format(os.path.join(wal_dir, '00000002.history')),
+            log_content)
+        self.assertIn(
+            'WARNING: History file is corrupted or missing: "{0}"'.format(os.path.join(wal_dir, '00000003.history')),
+            log_content)
+        self.assertIn(
+            'WARNING: History file is corrupted or missing: "{0}"'.format(os.path.join(wal_dir, '00000004.history')),
+            log_content)
+
         self.del_test_dir(module_name, fname)
 
 # TODO test with multiple not archived segments.

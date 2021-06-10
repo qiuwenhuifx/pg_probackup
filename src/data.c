@@ -300,7 +300,7 @@ prepare_page(ConnectionArgs *conn_arg,
 	 * Under high write load it's possible that we've read partly
 	 * flushed page, so try several times before throwing an error.
 	 */
-	if (backup_mode != BACKUP_MODE_DIFF_PTRACK || ptrack_version_num >= 20)
+	if (backup_mode != BACKUP_MODE_DIFF_PTRACK || ptrack_version_num >= 200)
 	{
 		int rc = 0;
 		while (!page_is_valid && try_again--)
@@ -400,7 +400,7 @@ prepare_page(ConnectionArgs *conn_arg,
 	 * We do this only in the cases of PTRACK 1.x versions backup
 	 */
 	if (backup_mode == BACKUP_MODE_DIFF_PTRACK
-		&& (ptrack_version_num >= 15 && ptrack_version_num < 20))
+		&& (ptrack_version_num >= 105 && ptrack_version_num < 200))
 	{
 		int rc = 0;
 		size_t page_size = 0;
@@ -711,8 +711,9 @@ backup_non_data_file(pgFile *file, pgFile *prev_file,
 	/*
 	 * If nonedata file exists in previous backup
 	 * and its mtime is less than parent backup start time ... */
-	if (prev_file && file->exists_in_prev &&
-		file->mtime <= parent_backup_time)
+	if ((pg_strcasecmp(file->name, RELMAPPER_FILENAME) != 0) &&
+		(prev_file && file->exists_in_prev &&
+		 file->mtime <= parent_backup_time))
 	{
 
 		file->crc = fio_get_crc32(from_fullpath, FIO_DB_HOST, false);
@@ -1850,7 +1851,7 @@ get_checksum_map(const char *fullpath, uint32 checksum_version,
 		if (feof(in))
 			break;
 
-		if (interrupted)
+		if (interrupted || thread_interrupted)
 			elog(ERROR, "Interrupted during page reading");
 	}
 
@@ -1913,7 +1914,7 @@ get_lsn_map(const char *fullpath, uint32 checksum_version,
 		if (feof(in))
 			break;
 
-		if (interrupted)
+		if (interrupted || thread_interrupted)
 			elog(ERROR, "Interrupted during page reading");
 	}
 
@@ -2000,13 +2001,14 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
 {
 	FILE *in = NULL;
 	FILE *out = NULL;
-	int   hdr_num = -1;
 	off_t  cur_pos_out = 0;
 	char  curr_page[BLCKSZ];
 	int   n_blocks_read = 0;
 	BlockNumber blknum = 0;
 	datapagemap_iterator_t *iter = NULL;
 	int   compressed_size = 0;
+	BackupPageHeader2 *header = NULL;
+	parray *harray = NULL;
 
 	/* stdio buffers */
 	char *in_buf = NULL;
@@ -2045,6 +2047,8 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
 		setvbuf(in, in_buf, _IOFBF, STDIO_BUFSIZE);
 	}
 
+	harray = parray_new();
+
 	while (blknum < file->n_blocks)
 	{
 		PageState page_st;
@@ -2062,17 +2066,15 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
 			if (!out)
 				out = open_local_file_rw(to_fullpath, &out_buf, STDIO_BUFSIZE);
 
-			hdr_num++;
+			header = pgut_new0(BackupPageHeader2);
+			*header = (BackupPageHeader2){
+					.block = blknum,
+					.pos = cur_pos_out,
+					.lsn = page_st.lsn,
+					.checksum = page_st.checksum,
+			};
 
-			if (!*headers)
-				*headers = (BackupPageHeader2 *) pgut_malloc(sizeof(BackupPageHeader2));
-			else
-				*headers = (BackupPageHeader2 *) pgut_realloc(*headers, (hdr_num+1) * sizeof(BackupPageHeader2));
-
-			(*headers)[hdr_num].block = blknum;
-			(*headers)[hdr_num].pos = cur_pos_out;
-			(*headers)[hdr_num].lsn = page_st.lsn;
-			(*headers)[hdr_num].checksum = page_st.checksum;
+			parray_append(harray, header);
 
 			compressed_size = compress_and_backup_page(file, blknum, in, out, &(file->crc),
 														rc, curr_page, calg, clevel,
@@ -2097,12 +2099,22 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
 	 * Add dummy header, so we can later extract the length of last header
 	 * as difference between their offsets.
 	 */
-	if (*headers)
+	if (parray_num(harray) > 0)
 	{
-		file->n_headers = hdr_num +1;
-		*headers = (BackupPageHeader2 *) pgut_realloc(*headers, (hdr_num+2) * sizeof(BackupPageHeader2));
-		(*headers)[hdr_num+1].pos = cur_pos_out;
+		size_t hdr_num = parray_num(harray);
+		size_t i;
+
+		file->n_headers = (int) hdr_num; /* is it valid? */
+		*headers = (BackupPageHeader2 *) pgut_malloc0((hdr_num + 1) * sizeof(BackupPageHeader2));
+		for (i = 0; i < hdr_num; i++)
+		{
+			header = (BackupPageHeader2 *)parray_get(harray, i);
+			(*headers)[i] = *header;
+			pg_free(header);
+		}
+		(*headers)[hdr_num] = (BackupPageHeader2){.pos=cur_pos_out};
 	}
+	parray_free(harray);
 
 	/* cleanup */
 	if (in && fclose(in))
@@ -2155,11 +2167,11 @@ get_data_file_headers(HeaderMap *hdr_map, pgFile *file, uint32 backup_version, b
 		return NULL;
 	}
 	/* disable buffering for header file */
-	setvbuf(in, NULL, _IONBF, BUFSIZ);
+	setvbuf(in, NULL, _IONBF, 0);
 
-	if (fseek(in, file->hdr_off, SEEK_SET))
+	if (fseeko(in, file->hdr_off, SEEK_SET))
 	{
-		elog(strict ? ERROR : WARNING, "Cannot seek to position %lu in page header map \"%s\": %s",
+		elog(strict ? ERROR : WARNING, "Cannot seek to position %llu in page header map \"%s\": %s",
 			file->hdr_off, hdr_map->path, strerror(errno));
 		goto cleanup;
 	}
@@ -2176,7 +2188,7 @@ get_data_file_headers(HeaderMap *hdr_map, pgFile *file, uint32 backup_version, b
 
 	if (fread(zheaders, 1, file->hdr_size, in) != file->hdr_size)
 	{
-		elog(strict ? ERROR : WARNING, "Cannot read header file at offset: %li len: %i \"%s\": %s",
+		elog(strict ? ERROR : WARNING, "Cannot read header file at offset: %llu len: %i \"%s\": %s",
 			file->hdr_off, file->hdr_size, hdr_map->path, strerror(errno));
 		goto cleanup;
 	}
@@ -2207,7 +2219,7 @@ get_data_file_headers(HeaderMap *hdr_map, pgFile *file, uint32 backup_version, b
 	if (hdr_crc != file->hdr_crc)
 	{
 		elog(strict ? ERROR : WARNING, "Header map for file \"%s\" crc mismatch \"%s\" "
-				"offset: %lu, len: %lu, current: %u, expected: %u",
+				"offset: %llu, len: %lu, current: %u, expected: %u",
 			file->rel_path, hdr_map->path, file->hdr_off, read_len, hdr_crc, file->hdr_crc);
 		goto cleanup;
 	}
@@ -2267,7 +2279,7 @@ write_page_headers(BackupPageHeader2 *headers, pgFile *file, HeaderMap *hdr_map,
 	{
 		elog(LOG, "Creating page header map \"%s\"", map_path);
 
-		hdr_map->fp = fopen(map_path, PG_BINARY_W);
+		hdr_map->fp = fopen(map_path, PG_BINARY_A);
 		if (hdr_map->fp == NULL)
 			elog(ERROR, "Cannot open header file \"%s\": %s",
 				 map_path, strerror(errno));
@@ -2296,7 +2308,7 @@ write_page_headers(BackupPageHeader2 *headers, pgFile *file, HeaderMap *hdr_map,
 				 file->rel_path, z_len);
 	}
 
-	elog(VERBOSE, "Writing headers for file \"%s\" offset: %li, len: %i, crc: %u",
+	elog(VERBOSE, "Writing headers for file \"%s\" offset: %llu, len: %i, crc: %u",
 			file->rel_path, file->hdr_off, z_len, file->hdr_crc);
 
 	if (fwrite(zheaders, 1, z_len, hdr_map->fp) != z_len)

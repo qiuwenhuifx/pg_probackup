@@ -27,8 +27,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             initdb_params=['--data-checksums'],
             pg_options={
-                'checkpoint_timeout': '300s',
-                'autovacuum': 'off'})
+                'checkpoint_timeout': '300s'})
 
         node_restored = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node_restored'))
@@ -100,7 +99,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(result1, result2)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node, node_restored])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     def test_page_vacuum_truncate_1(self):
@@ -115,8 +114,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -373,7 +371,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                 'fsync': 'off',
                 'shared_buffers': '1GB',
                 'maintenance_work_mem': '1GB',
-                'autovacuum': 'off',
                 'full_page_writes': 'off'})
 
         self.init_pb(backup_dir)
@@ -447,7 +444,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
             set_replication=True, initdb_params=['--data-checksums'],
             pg_options={
                 'checkpoint_timeout': '30s',
-                'autovacuum': 'off'
             }
         )
 
@@ -521,7 +517,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
             initdb_params=['--data-checksums'],
             pg_options={
                 'checkpoint_timeout': '30s',
-                'autovacuum': 'off'
             }
         )
 
@@ -757,8 +752,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                     self.output, self.cmd))
         except ProbackupException as e:
             self.assertTrue(
-                'INFO: Wait for WAL segment' in e.message and
-                'to be archived' in e.message and
                 'Could not read WAL record at' in e.message and
                 'is absent' in e.message,
                 '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
@@ -782,8 +775,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                     self.output, self.cmd))
         except ProbackupException as e:
             self.assertTrue(
-                'INFO: Wait for WAL segment' in e.message and
-                'to be archived' in e.message and
                 'Could not read WAL record at' in e.message and
                 'is absent' in e.message,
                 '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
@@ -872,8 +863,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                     self.output, self.cmd))
         except ProbackupException as e:
             self.assertTrue(
-                'INFO: Wait for WAL segment' in e.message and
-                'to be archived' in e.message and
                 'Could not read WAL record at' in e.message and
                 'Possible WAL corruption. Error has occured during reading WAL segment' in e.message,
                 '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
@@ -896,8 +885,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                     self.output, self.cmd))
         except ProbackupException as e:
             self.assertTrue(
-                'INFO: Wait for WAL segment' in e.message and
-                'to be archived' in e.message and
                 'Could not read WAL record at' in e.message and
                 'Possible WAL corruption. Error has occured during reading WAL segment "{0}"'.format(
                     file) in e.message,
@@ -997,8 +984,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                     self.output, self.cmd))
         except ProbackupException as e:
             self.assertTrue(
-                'INFO: Wait for WAL segment' in e.message and
-                'to be archived' in e.message and
                 'Could not read WAL record at' in e.message and
                 'Possible WAL corruption. Error has occured during reading WAL segment' in e.message,
                 '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
@@ -1020,8 +1005,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
                 "Output: {0} \n CMD: {1}".format(
                     self.output, self.cmd))
         except ProbackupException as e:
-            self.assertIn('INFO: Wait for WAL segment', e.message)
-            self.assertIn('to be archived', e.message)
             self.assertIn('Could not read WAL record at', e.message)
             self.assertIn('WAL file is from different database system: '
                 'WAL file database system identifier is', e.message)
@@ -1086,7 +1069,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
             pg_options={
                 'max_wal_size': '10GB',
                 'checkpoint_timeout': '5min',
-                'autovacuum': 'off'
             }
         )
 
@@ -1202,8 +1184,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1342,7 +1323,7 @@ class PageTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
@@ -1415,7 +1396,6 @@ class PageTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             initdb_params=['--data-checksums'],
             pg_options={
-                'autovacuum': 'off',
                 'shared_buffers': '512MB',
                 'max_wal_size': '3GB'})
 

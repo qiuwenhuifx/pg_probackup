@@ -270,7 +270,8 @@ pgut_connect(const char *host, const char *port,
 
 PGconn *
 pgut_connect_replication(const char *host, const char *port,
-						 const char *dbname, const char *username)
+						 const char *dbname, const char *username,
+						 bool strict)
 {
 	PGconn	   *tmpconn;
 	int			argcount = 7;	/* dbname, replication, fallback_app_name,
@@ -356,7 +357,7 @@ pgut_connect_replication(const char *host, const char *port,
 			continue;
 		}
 
-		elog(ERROR, "could not connect to database %s: %s",
+		elog(strict ? ERROR : WARNING, "could not connect to database %s: %s",
 			 dbname, PQerrorMessage(tmpconn));
 		PQfinish(tmpconn);
 		free(values);
@@ -877,6 +878,17 @@ pgut_malloc(size_t size)
 }
 
 void *
+pgut_malloc0(size_t size)
+{
+	char *ret;
+
+	ret = pgut_malloc(size);
+	memset(ret, 0, size);
+
+	return ret;
+}
+
+void *
 pgut_realloc(void *p, size_t size)
 {
 	char *ret;
@@ -1172,7 +1184,7 @@ pgut_rmtree(const char *path, bool rmtopdir, bool strict)
 	/* now we have the names we can start removing things */
 	for (filename = filenames; *filename; filename++)
 	{
-		snprintf(pathbuf, MAXPGPATH, "%s/%s", path, *filename);
+		join_path_components(pathbuf, path, *filename);
 
 		if (lstat(pathbuf, &statbuf) != 0)
 		{

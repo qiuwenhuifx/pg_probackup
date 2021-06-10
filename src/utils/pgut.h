@@ -40,8 +40,8 @@ extern char *pgut_get_conninfo_string(PGconn *conn);
 extern PGconn *pgut_connect(const char *host, const char *port,
 							const char *dbname, const char *username);
 extern PGconn *pgut_connect_replication(const char *host, const char *port,
-										const char *dbname,
-										const char *username);
+										const char *dbname, const char *username,
+										bool strict);
 extern void pgut_disconnect(PGconn *conn);
 extern void pgut_disconnect_callback(bool fatal, void *userdata);
 extern PGresult *pgut_execute(PGconn* conn, const char *query, int nParams,
@@ -59,10 +59,12 @@ extern int pgut_wait(int num, PGconn *connections[], struct timeval *timeout);
  * memory allocators
  */
 extern void *pgut_malloc(size_t size);
+extern void *pgut_malloc0(size_t size);
 extern void *pgut_realloc(void *p, size_t size);
 extern char *pgut_strdup(const char *str);
 
 #define pgut_new(type)			((type *) pgut_malloc(sizeof(type)))
+#define pgut_new0(type)			((type *) pgut_malloc0(sizeof(type)))
 #define pgut_newarray(type, n)	((type *) pgut_malloc(sizeof(type) * (n)))
 
 /*

@@ -19,9 +19,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.show_pb(backup_dir)
@@ -156,8 +154,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.show_pb(backup_dir)
@@ -296,9 +293,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
             ptrack_enable=True,
-            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.show_pb(backup_dir)
@@ -408,9 +403,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -572,9 +565,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -630,8 +621,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -703,8 +693,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -826,8 +815,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -953,8 +941,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1036,8 +1023,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1112,8 +1098,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1217,8 +1202,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1297,8 +1281,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1403,8 +1386,7 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         self.init_pb(backup_dir, old_binary=True)
         self.add_instance(backup_dir, 'node', node, old_binary=True)
@@ -1416,6 +1398,88 @@ class CompatibilityTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node',node, old_binary=True, options=['--stream'])
 
         self.delete_pb(backup_dir, 'node', backup_id)
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+        # @unittest.skip("skip")
+    def test_compatibility_tablespace(self):
+        """
+        https://github.com/postgrespro/pg_probackup/issues/348
+        """
+        fname = self.id().split('.')[3]
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            set_replication=True,
+            initdb_params=['--data-checksums'])
+
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node, old_binary=True)
+        node.slow_start()
+
+        backup_id = self.backup_node(
+            backup_dir, 'node', node, backup_type="full",
+            options=["-j", "4", "--stream"], old_binary=True)
+
+        tblspace_old_path = self.get_tblspace_path(node, 'tblspace_old')
+
+        self.create_tblspace_in_node(
+            node, 'tblspace',
+            tblspc_path=tblspace_old_path)
+
+        node.safe_psql(
+            "postgres",
+            "create table t_heap_lame tablespace tblspace "
+            "as select 1 as id, md5(i::text) as text, "
+            "md5(repeat(i::text,10))::tsvector as tsvector "
+            "from generate_series(0,1000) i")
+
+        tblspace_new_path = self.get_tblspace_path(node, 'tblspace_new')
+
+        node_restored = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node_restored'))
+        node_restored.cleanup()
+
+        try:
+            self.restore_node(
+                backup_dir, 'node', node_restored,
+                options=[
+                    "-j", "4",
+                    "-T", "{0}={1}".format(
+                        tblspace_old_path, tblspace_new_path)])
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because tablespace mapping is incorrect"
+                "\n Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except ProbackupException as e:
+            self.assertIn(
+                'ERROR: Backup {0} has no tablespaceses, '
+                'nothing to remap'.format(backup_id),
+                e.message,
+                '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
+                    repr(e.message), self.cmd))
+
+        self.backup_node(
+            backup_dir, 'node', node, backup_type="delta",
+            options=["-j", "4", "--stream"], old_binary=True)
+
+        self.restore_node(
+            backup_dir, 'node', node_restored,
+            options=[
+                "-j", "4",
+                "-T", "{0}={1}".format(
+                    tblspace_old_path, tblspace_new_path)])
+
+        if self.paranoia:
+            pgdata = self.pgdata_content(node.data_dir)
+
+        if self.paranoia:
+            pgdata_restored = self.pgdata_content(node_restored.data_dir)
+            self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)

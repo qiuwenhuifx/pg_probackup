@@ -23,8 +23,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -86,8 +85,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -236,8 +234,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            set_replication=True,
-            pg_options={'autovacuum': 'off'})
+            set_replication=True)
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -298,8 +295,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            set_replication=True,
-            pg_options={'autovacuum': 'off'})
+            set_replication=True)
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -661,8 +657,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            set_replication=True,
-            pg_options={'autovacuum': 'off'})
+            set_replication=True)
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -720,7 +715,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
                     repr(e.message), self.cmd))
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     def test_incr_checksum_restore(self):
@@ -734,7 +729,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -809,7 +804,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node, node_1])
+        self.del_test_dir(module_name, fname)
 
 
     # @unittest.skip("skip")
@@ -824,7 +819,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -898,7 +893,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node, node_1])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     def test_incr_lsn_sanity(self):
@@ -913,7 +908,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -967,7 +962,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
                     repr(e.message), self.cmd))
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node_1])
+        self.del_test_dir(module_name, fname)
 
         # @unittest.skip("skip")
     def test_incr_checksum_sanity(self):
@@ -980,8 +975,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1026,7 +1020,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.compare_pgdata(pgdata, pgdata_restored)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node_1])
+        self.del_test_dir(module_name, fname)
 
 
         # @unittest.skip("skip")
@@ -1038,7 +1032,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
 #            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1096,7 +1090,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on'})
+            pg_options={'wal_log_hints': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1153,8 +1147,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1225,8 +1218,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1299,7 +1291,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
             initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off', 'wal_log_hints': 'on', 'hot_standby': 'on'})
+            pg_options={'wal_log_hints': 'on', 'hot_standby': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1408,7 +1400,6 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             initdb_params=['--data-checksums'],
             pg_options={
-                'autovacuum': 'off',
                 'hot_standby': 'on'})
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -1561,7 +1552,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         pgbench.wait()
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [new_master, old_master])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     def test_make_replica_via_incr_lsn_restore(self):
@@ -1634,7 +1625,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         pgbench.wait()
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [new_master, old_master])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     # @unittest.expectedFailure
@@ -1644,10 +1635,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True,
-#            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            set_replication=True)
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1711,16 +1699,16 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
 
     # @unittest.skip("skip")
     # @unittest.expectedFailure
+    # This test will pass with Enterprise
+    # because it has checksums enabled by default
+    @unittest.skipIf(ProbackupTest.enterprise, 'skip')
     def test_incr_lsn_long_xact_1(self):
         """
         """
         fname = self.id().split('.')[3]
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
-            set_replication=True,
-#            initdb_params=['--data-checksums'],
-            pg_options={
-                'autovacuum': 'off'})
+            set_replication=True)
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1800,7 +1788,6 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
             set_replication=True,
             initdb_params=['--data-checksums'],
             pg_options={
-                'autovacuum': 'off',
                 'full_page_writes': 'off',
                 'wal_log_hints': 'off'})
 
@@ -1875,7 +1862,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
             '1')
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node])
+        self.del_test_dir(module_name, fname)
 
     # @unittest.skip("skip")
     # @unittest.expectedFailure
@@ -1886,8 +1873,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -1960,8 +1946,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         node = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
-            initdb_params=['--data-checksums'],
-            pg_options={'autovacuum': 'off'})
+            initdb_params=['--data-checksums'])
 
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         self.init_pb(backup_dir)
@@ -2134,7 +2119,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.assertNotIn('PANIC', output)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node, node2])
+        self.del_test_dir(module_name, fname)
 
     def test_incremental_partial_restore_exclude_lsn(self):
         """"""
@@ -2244,7 +2229,7 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.assertNotIn('PANIC', output)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node2])
+        self.del_test_dir(module_name, fname)
 
     def test_incremental_partial_restore_exclude_tablespace_checksum(self):
         """"""
@@ -2388,7 +2373,66 @@ class IncrRestoreTest(ProbackupTest, unittest.TestCase):
         self.assertNotIn('PANIC', output)
 
         # Clean after yourself
-        self.del_test_dir(module_name, fname, [node2])
+        self.del_test_dir(module_name, fname)
+
+    def test_incremental_pg_filenode_map(self):
+        """
+        https://github.com/postgrespro/pg_probackup/issues/320
+        """
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            initdb_params=['--data-checksums'])
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        node1 = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node1'),
+            initdb_params=['--data-checksums'])
+        node1.cleanup()
+
+        node.pgbench_init(scale=5)
+
+        # FULL backup
+        backup_id = self.backup_node(backup_dir, 'node', node)
+
+        # in node1 restore full backup
+        self.restore_node(backup_dir, 'node', node1)
+        self.set_auto_conf(node1, {'port': node1.port})
+        node1.slow_start()
+
+        pgbench = node.pgbench(
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            options=['-T', '10', '-c', '1'])
+
+        pgbench = node1.pgbench(
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            options=['-T', '10', '-c', '1'])
+
+        node.safe_psql(
+            'postgres',
+            'reindex index pg_type_oid_index')
+
+        # FULL backup
+        backup_id = self.backup_node(backup_dir, 'node', node)
+
+        node1.stop()
+
+        # incremental restore into node1
+        self.restore_node(backup_dir, 'node', node1, options=["-I", "checksum"])
+
+        self.set_auto_conf(node1, {'port': node1.port})
+        node1.slow_start()
+
+        node1.safe_psql(
+            'postgres',
+            'select 1')
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
 
 # check that MinRecPoint and BackupStartLsn are correctly used in case of --incrementa-lsn
-# incremental restore + partial restore.
