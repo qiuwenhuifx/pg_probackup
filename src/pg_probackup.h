@@ -308,7 +308,7 @@ typedef enum ShowFormat
 #define BYTES_INVALID		(-1) /* file didn`t changed since previous backup, DELTA backup do not rely on it */
 #define FILE_NOT_FOUND		(-2) /* file disappeared during backup */
 #define BLOCKNUM_INVALID	(-1)
-#define PROGRAM_VERSION	"2.4.16"
+#define PROGRAM_VERSION	"2.4.17"
 
 /* update when remote agent API or behaviour changes */
 #define AGENT_PROTOCOL_VERSION 20409
@@ -1071,8 +1071,6 @@ extern PageState *get_checksum_map(const char *fullpath, uint32 checksum_version
 								int n_blocks, XLogRecPtr dest_stop_lsn, BlockNumber segmentno);
 extern datapagemap_t *get_lsn_map(const char *fullpath, uint32 checksum_version,
 								  int n_blocks, XLogRecPtr shift_lsn, BlockNumber segmentno);
-extern pid_t check_postmaster(const char *pgdata);
-
 extern bool validate_file_pages(pgFile *file, const char *fullpath, XLogRecPtr stop_lsn,
 							    uint32 checksum_version, uint32 backup_version, HeaderMap *hdr_map);
 

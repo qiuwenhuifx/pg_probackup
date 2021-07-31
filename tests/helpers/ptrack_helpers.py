@@ -139,6 +139,10 @@ def slow_start(self, replica=False):
         except testgres.QueryException as e:
             if 'database system is starting up' in e.message:
                 pass
+            elif 'FATAL:  the database system is not accepting connections' in e.message:
+                pass
+            elif replica and 'Hot standby mode is disabled' in e.message:
+                raise e
             else:
                 raise e
 
@@ -1949,6 +1953,9 @@ class GDBobj(ProbackupTest):
             if line.startswith('*stopped,reason="breakpoint-hit"'):
                 return True
         return False
+
+    def quit(self):
+        self.proc.terminate()
 
     # use for breakpoint, run, continue
     def _execute(self, cmd, running=True):
