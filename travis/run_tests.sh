@@ -32,10 +32,22 @@ PG_SRC=$PWD/postgres
 echo "############### Getting Postgres sources:"
 git clone https://github.com/postgres/postgres.git -b $PG_BRANCH --depth=1
 
+# Clone ptrack
+if [ "$PTRACK_PATCH_PG_BRANCH" != "off" ]; then
+    git clone https://github.com/postgrespro/ptrack.git -b master --depth=1
+    export PG_PROBACKUP_PTRACK=on
+else
+    export PG_PROBACKUP_PTRACK=off
+fi
+
+
 # Compile and install Postgres
 echo "############### Compiling Postgres:"
 cd postgres # Go to postgres dir
-./configure --prefix=$PGHOME --enable-debug --enable-cassert --enable-depend --enable-tap-tests
+if [ "$PG_PROBACKUP_PTRACK" = "on" ]; then
+    git apply -3 ../ptrack/patches/${PTRACK_PATCH_PG_BRANCH}-ptrack-core.diff
+fi
+CFLAGS="-O0" ./configure --prefix=$PGHOME --enable-debug --enable-cassert --enable-depend --enable-tap-tests
 make -s -j$(nproc) install
 #make -s -j$(nproc) -C 'src/common' install
 #make -s -j$(nproc) -C 'src/port' install
@@ -46,6 +58,11 @@ make -s -j$(nproc) -C contrib/ install
 export PATH=$PGHOME/bin:$PATH
 export LD_LIBRARY_PATH=$PGHOME/lib
 export PG_CONFIG=$(which pg_config)
+
+if [ "$PG_PROBACKUP_PTRACK" = "on" ]; then
+    echo "############### Compiling Ptrack:"
+    make USE_PGXS=1 -C ../ptrack install
+fi
 
 # Get amcheck if missing
 if [ ! -d "contrib/amcheck" ]; then
@@ -64,6 +81,12 @@ which pg_config
 # Show pg_config just in case
 echo "############### pg_config:"
 pg_config
+
+# Show kernel parameters
+echo "############### kernel params:"
+cat /proc/sys/kernel/yama/ptrace_scope
+sudo sysctl kernel.yama.ptrace_scope=0
+cat /proc/sys/kernel/yama/ptrace_scope
 
 # Build and install pg_probackup (using PG_CPPFLAGS and SHLIB_LINK for gcov)
 echo "############### Compiling and installing pg_probackup:"

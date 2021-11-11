@@ -83,6 +83,12 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             pg_options={
                 'checkpoint_timeout': '30s'}
             )
+
+        if self.get_version(node) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because pg_control_checkpoint() is not supported in PG 9.5')
+
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)
         self.set_archiving(backup_dir, 'node', node)
@@ -432,6 +438,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             'pg_probackup archive-push completed successfully',
             log_content)
 
+        # btw check that console coloring codes are not slipped into log file
+        self.assertNotIn('[0m', log_content)
+
+        print(log_content)
+
         # Clean after yourself
         self.del_test_dir(module_name, fname)
 
@@ -693,6 +704,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                 'checkpoint_timeout': '30s',
                 'max_wal_size': '32MB'})
 
+        if self.get_version(master) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
+
         self.init_pb(backup_dir)
         # ADD INSTANCE 'MASTER'
         self.add_instance(backup_dir, 'master', master)
@@ -728,7 +744,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         # to original data
         master.psql(
             "postgres",
-            "insert into t_heap as select i as id, md5(i::text) as text, "
+            "insert into t_heap select i as id, md5(i::text) as text, "
             "md5(repeat(i::text,10))::tsvector as tsvector "
             "from generate_series(256,512) i")
         before = master.safe_psql("postgres", "SELECT * FROM t_heap")
@@ -763,7 +779,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         # to original data
         master.psql(
             "postgres",
-            "insert into t_heap as select i as id, md5(i::text) as text, "
+            "insert into t_heap select i as id, md5(i::text) as text, "
             "md5(repeat(i::text,10))::tsvector as tsvector "
             "from generate_series(512,80680) i")
 
@@ -818,6 +834,12 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             pg_options={
                 'archive_timeout': '10s'}
             )
+
+        if self.get_version(master) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
+
         replica = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'replica'))
         replica.cleanup()
@@ -908,6 +930,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                 'checkpoint_timeout': '30s',
                 'archive_timeout': '10s'})
 
+        if self.get_version(master) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
+
         replica = self.make_simple_node(
             base_dir=os.path.join(module_name, fname, 'replica'))
         replica.cleanup()
@@ -953,7 +980,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
 
         master.psql(
             "postgres",
-            "insert into t_heap as select i as id, md5(i::text) as text, "
+            "insert into t_heap select i as id, md5(i::text) as text, "
             "md5(repeat(i::text,10))::tsvector as tsvector "
             "from generate_series(0,10000) i")
 
@@ -1547,8 +1574,8 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         double segment - compressed and not
         """
         if not self.archive_compress:
-            return self.fail(
-                'You need to enable ARCHIVE_COMPRESSION for this test to run')
+            self.skipTest('You need to enable ARCHIVE_COMPRESSION '
+                          'for this test to run')
 
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -1602,8 +1629,8 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         double segment - compressed and not
         """
         if not self.archive_compress:
-            return self.fail(
-                'You need to enable ARCHIVE_COMPRESSION for this test to run')
+            self.skipTest('You need to enable ARCHIVE_COMPRESSION '
+                          'for this test to run')
 
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
@@ -1659,6 +1686,9 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         check that '--archive-host', '--archive-user', '--archiver-port'
         and '--restore-command' are working as expected.
         """
+        if not self.remote:
+            self.skipTest("You must enable PGPROBACKUP_SSH_REMOTE"
+                          " for run this test")
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -2005,6 +2035,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
             base_dir=os.path.join(module_name, fname, 'node'),
             set_replication=True,
             initdb_params=['--data-checksums'])
+
+        if self.get_version(node) < self.version_to_num('9.6.0'):
+            self.del_test_dir(module_name, fname)
+            return unittest.skip(
+                'Skipped because backup from replica is not supported in PG 9.5')
 
         self.init_pb(backup_dir)
         self.add_instance(backup_dir, 'node', node)

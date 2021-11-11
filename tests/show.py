@@ -212,6 +212,9 @@ class ShowTest(ProbackupTest, unittest.TestCase):
     # @unittest.expectedFailure
     def test_corrupt_correctness(self):
         """backup.control contains invalid option"""
+        if not self.remote:
+            self.skipTest("You must enable PGPROBACKUP_SSH_REMOTE"
+                          " for run this test")
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -232,12 +235,7 @@ class ShowTest(ProbackupTest, unittest.TestCase):
         output_local = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(backup_dir, 'node', node)
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node,
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(backup_dir, 'node', node)
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -260,13 +258,8 @@ class ShowTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
         self.delete_pb(backup_dir, 'node', backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='delta')
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='delta',
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='delta')
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -290,13 +283,8 @@ class ShowTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
         self.delete_pb(backup_dir, 'node', backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='page')
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='page',
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='page')
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -318,6 +306,9 @@ class ShowTest(ProbackupTest, unittest.TestCase):
     # @unittest.expectedFailure
     def test_corrupt_correctness_1(self):
         """backup.control contains invalid option"""
+        if not self.remote:
+            self.skipTest("You must enable PGPROBACKUP_SSH_REMOTE"
+                          " for run this test")
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -338,12 +329,7 @@ class ShowTest(ProbackupTest, unittest.TestCase):
         output_local = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(backup_dir, 'node', node)
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node,
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(backup_dir, 'node', node)
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -370,13 +356,8 @@ class ShowTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
         self.delete_pb(backup_dir, 'node', backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='delta')
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='delta',
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='delta')
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -400,13 +381,8 @@ class ShowTest(ProbackupTest, unittest.TestCase):
             backup_dir, 'node', as_json=False, backup_id=backup_local_id)
         self.delete_pb(backup_dir, 'node', backup_local_id)
 
-        if self.remote:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='page')
-        else:
-            backup_remote_id = self.backup_node(
-                backup_dir, 'node', node, backup_type='page',
-                options=['--remote-proto=ssh', '--remote-host=localhost'])
+        backup_remote_id = self.backup_node(
+            backup_dir, 'node', node, backup_type='page')
 
         output_remote = self.show_pb(
             backup_dir, 'node', as_json=False, backup_id=backup_remote_id)
@@ -428,6 +404,9 @@ class ShowTest(ProbackupTest, unittest.TestCase):
     # @unittest.expectedFailure
     def test_corrupt_correctness_2(self):
         """backup.control contains invalid option"""
+        if not self.remote:
+            self.skipTest("You must enable PGPROBACKUP_SSH_REMOTE"
+                          " for run this test")
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -532,6 +511,42 @@ class ShowTest(ProbackupTest, unittest.TestCase):
         self.assertEqual(
             output_local['uncompressed-bytes'],
             output_remote['uncompressed-bytes'])
+
+        # Clean after yourself
+        self.del_test_dir(module_name, fname)
+
+    # @unittest.skip("skip")
+    # @unittest.expectedFailure
+    def test_color_with_no_terminal(self):
+        """backup.control contains invalid option"""
+        fname = self.id().split('.')[3]
+        backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
+        node = self.make_simple_node(
+            base_dir=os.path.join(module_name, fname, 'node'),
+            initdb_params=['--data-checksums'],
+            pg_options={'autovacuum': 'off'})
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        node.slow_start()
+
+        node.pgbench_init(scale=1)
+
+        # FULL
+        try:
+            self.backup_node(
+                backup_dir, 'node', node, options=['--archive-timeout=1s'])
+            # we should die here because exception is what we expect to happen
+            self.assertEqual(
+                1, 0,
+                "Expecting Error because archiving is disabled\n "
+                "Output: {0} \n CMD: {1}".format(
+                    repr(self.output), self.cmd))
+        except ProbackupException as e:
+            self.assertNotIn(
+                '[0m', e.message,
+                '\n Unexpected Error Message: {0}\n CMD: {1}'.format(
+                    repr(e.message), self.cmd))
 
         # Clean after yourself
         self.del_test_dir(module_name, fname)

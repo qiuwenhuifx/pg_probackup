@@ -3,7 +3,7 @@
  * pgut.c
  *
  * Portions Copyright (c) 2009-2013, NIPPON TELEGRAPH AND TELEPHONE CORPORATION
- * Portions Copyright (c) 2017-2019, Postgres Professional
+ * Portions Copyright (c) 2017-2021, Postgres Professional
  *
  *-------------------------------------------------------------------------
  */
@@ -18,6 +18,12 @@
 
 #if PG_VERSION_NUM >= 140000
 #include "common/string.h"
+#endif
+
+#if PG_VERSION_NUM >= 100000
+#include "common/connect.h"
+#else
+#include "fe_utils/connect.h"
 #endif
 
 #include <time.h>
@@ -257,7 +263,7 @@ pgut_connect(const char *host, const char *port,
 			pthread_lock(&atexit_callback_disconnect_mutex);
 			pgut_atexit_push(pgut_disconnect_callback, conn);
 			pthread_mutex_unlock(&atexit_callback_disconnect_mutex);
-			return conn;
+			break;
 		}
 
 		if (conn && PQconnectionNeedsPassword(conn) && prompt_password)
@@ -279,6 +285,28 @@ pgut_connect(const char *host, const char *port,
 		PQfinish(conn);
 		return NULL;
 	}
+
+	/*
+	 * Fix for CVE-2018-1058. This code was taken with small modification from
+	 * src/bin/pg_basebackup/streamutil.c:GetConnection()
+	 */
+	if (dbname != NULL)
+	{
+		PGresult   *res;
+
+		res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			elog(ERROR, "could not clear search_path: %s",
+						 PQerrorMessage(conn));
+			PQclear(res);
+			PQfinish(conn);
+			return NULL;
+		}
+		PQclear(res);
+	}
+
+	return conn;
 }
 
 PGconn *
@@ -923,6 +951,29 @@ pgut_strdup(const char *str)
 	if ((ret = strdup(str)) == NULL)
 		elog(ERROR, "could not duplicate string \"%s\": %s",
 			str, strerror(errno));
+	return ret;
+}
+
+char *
+pgut_strndup(const char *str, size_t n)
+{
+	char *ret;
+
+	if (str == NULL)
+		return NULL;
+
+#if _POSIX_C_SOURCE >= 200809L
+	if ((ret = strndup(str, n)) == NULL)
+		elog(ERROR, "could not duplicate string \"%s\": %s",
+			str, strerror(errno));
+#else /* WINDOWS doesn't have strndup() */
+        if ((ret = malloc(n + 1)) == NULL)
+		elog(ERROR, "could not duplicate string \"%s\": %s",
+			str, strerror(errno));
+
+        memcpy(ret, str, n);
+        ret[n] = '\0';
+#endif
 	return ret;
 }
 
