@@ -48,7 +48,7 @@ catchup_init_state(PGNodeInfo	*source_node_info, const char *source_pgdata, cons
 
 	/* Get WAL segments size and system ID of source PG instance */
 	instance_config.xlog_seg_size = get_xlog_seg_size(source_pgdata);
-	instance_config.system_identifier = get_system_identifier(source_pgdata, FIO_DB_HOST);
+	instance_config.system_identifier = get_system_identifier(source_pgdata, FIO_DB_HOST, false);
 	current.start_time = time(NULL);
 
 	strlcpy(current.program_version, PROGRAM_VERSION, sizeof(current.program_version));
@@ -163,7 +163,7 @@ catchup_preflight_checks(PGNodeInfo *source_node_info, PGconn *source_conn,
 		uint64	source_conn_id, source_id, dest_id;
 
 		source_conn_id = get_remote_system_identifier(source_conn);
-		source_id = get_system_identifier(source_pgdata, FIO_DB_HOST); /* same as instance_config.system_identifier */
+		source_id = get_system_identifier(source_pgdata, FIO_DB_HOST, false); /* same as instance_config.system_identifier */
 
 		if (source_conn_id != source_id)
 			elog(ERROR, "Database identifiers mismatch: we connected to DB id %lu, but in \"%s\" we found id %lu",
@@ -171,7 +171,7 @@ catchup_preflight_checks(PGNodeInfo *source_node_info, PGconn *source_conn,
 
 		if (current.backup_mode != BACKUP_MODE_FULL)
 		{
-			dest_id = get_system_identifier(dest_pgdata, FIO_LOCAL_HOST);
+			dest_id = get_system_identifier(dest_pgdata, FIO_LOCAL_HOST, false);
 			if (source_conn_id != dest_id)
 			elog(ERROR, "Database identifiers mismatch: we connected to DB id %lu, but in \"%s\" we found id %lu",
 				source_conn_id, dest_pgdata, dest_id);
@@ -203,6 +203,8 @@ catchup_preflight_checks(PGNodeInfo *source_node_info, PGconn *source_conn,
 
 		/* fill dest_redo.lsn and dest_redo.tli */
 		get_redo(dest_pgdata, FIO_LOCAL_HOST, &dest_redo);
+		elog(VERBOSE, "source.tli = %X, dest_redo.lsn = %X/%X, dest_redo.tli = %X",
+			current.tli, (uint32) (dest_redo.lsn >> 32), (uint32) dest_redo.lsn, dest_redo.tli);
 
 		if (current.tli != 1)
 		{
@@ -285,11 +287,12 @@ catchup_check_tablespaces_existance_in_tbsmapping(PGconn *conn)
 static parray*
 catchup_get_tli_history(ConnectionOptions *conn_opt, TimeLineID tli)
 {
-	PGresult     *res;
-	PGconn	     *conn;
-	char         *history;
-	char          query[128];
-	parray	     *result = NULL;
+	PGresult             *res;
+	PGconn	             *conn;
+	char                 *history;
+	char                  query[128];
+	parray	             *result = NULL;
+	TimeLineHistoryEntry *entry = NULL;
 
 	snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", tli);
 
@@ -335,6 +338,12 @@ catchup_get_tli_history(ConnectionOptions *conn_opt, TimeLineID tli)
 	/* some cleanup */
 	pg_free(history);
 	PQclear(res);
+
+	/* append last timeline entry (as read_timeline_history() do) */
+	entry = pgut_new(TimeLineHistoryEntry);
+	entry->tli = tli;
+	entry->end = InvalidXLogRecPtr;
+	parray_insert(result, 0, entry);
 
 	return result;
 }
@@ -921,7 +930,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 				char		fullpath[MAXPGPATH];
 
 				join_path_components(fullpath, dest_pgdata, file->rel_path);
-				fio_delete(file->mode, fullpath, FIO_DB_HOST);
+				fio_delete(file->mode, fullpath, FIO_LOCAL_HOST);
 				elog(VERBOSE, "Deleted file \"%s\"", fullpath);
 
 				/* shrink dest pgdata list */
