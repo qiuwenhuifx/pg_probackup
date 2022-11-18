@@ -56,7 +56,8 @@ typedef enum
 	FIO_CHECK_POSTMASTER,
 	FIO_GET_ASYNC_ERROR,
 	FIO_WRITE_ASYNC,
-	FIO_READLINK
+	FIO_READLINK,
+	FIO_PAGE_ZERO
 } fio_operations;
 
 typedef enum
@@ -91,7 +92,7 @@ extern fio_location MyLocation;
 extern void    fio_redirect(int in, int out, int err);
 extern void    fio_communicate(int in, int out);
 
-extern int     fio_get_agent_version(void);
+extern void    fio_get_agent_version(int* protocol, char* payload_buf, size_t payload_buf_size);
 extern FILE*   fio_fopen(char const* name, char const* mode, fio_location location);
 extern size_t  fio_fwrite(FILE* f, void const* buf, size_t size);
 extern ssize_t fio_fwrite_async_compressed(FILE* f, void const* buf, size_t size, int compress_alg);
@@ -120,7 +121,10 @@ extern int     fio_truncate(int fd, off_t size);
 extern int     fio_close(int fd);
 extern void    fio_disconnect(void);
 extern int     fio_sync(char const* path, fio_location location);
-extern pg_crc32 fio_get_crc32(const char *file_path, fio_location location, bool decompress);
+extern pg_crc32 fio_get_crc32(const char *file_path, fio_location location,
+							  bool decompress, bool missing_ok);
+extern pg_crc32 fio_get_crc32_truncated(const char *file_path, fio_location location,
+										bool missing_ok);
 
 extern int     fio_rename(char const* old_path, char const* new_path, fio_location location);
 extern int     fio_symlink(char const* target, char const* link_path, bool overwrite, fio_location location);

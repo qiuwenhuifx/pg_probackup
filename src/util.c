@@ -3,7 +3,7 @@
  * util.c: log messages to log file or stderr, and misc code.
  *
  * Portions Copyright (c) 2009-2011, NIPPON TELEGRAPH AND TELEPHONE CORPORATION
- * Portions Copyright (c) 2015-2019, Postgres Professional
+ * Portions Copyright (c) 2015-2021, Postgres Professional
  *
  *-------------------------------------------------------------------------
  */
@@ -349,22 +349,6 @@ get_pgcontrol_checksum(const char *pgdata_path)
 	return ControlFile.crc;
 }
 
-DBState
-get_system_dbstate(const char *pgdata_path, fio_location location)
-{
-	ControlFileData ControlFile;
-	char	   *buffer;
-	size_t		size;
-
-	buffer = slurpFile(pgdata_path, XLOG_CONTROL_FILE, &size, false, location);
-	if (buffer == NULL)
-		return 0;
-	digestControlFile(&ControlFile, buffer, size);
-	pg_free(buffer);
-
-	return ControlFile.state;
-}
-
 void
 get_redo(const char *pgdata_path, fio_location pgdata_location, RedoParams *redo)
 {
@@ -589,7 +573,7 @@ datapagemap_print_debug(datapagemap_t *map)
 
 	iter = datapagemap_iterate(map);
 	while (datapagemap_next(iter, &blocknum))
-		elog(INFO, "  block %u", blocknum);
+		elog(VERBOSE, "  block %u", blocknum);
 
 	pg_free(iter);
 }

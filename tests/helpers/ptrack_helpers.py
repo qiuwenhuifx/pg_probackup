@@ -89,21 +89,45 @@ def dir_files(base_dir):
 
 def is_enterprise():
     # pg_config --help
-    if os.name == 'posix':
-        cmd = [os.environ['PG_CONFIG'], '--help']
-
-    elif os.name == 'nt':
-        cmd = [[os.environ['PG_CONFIG']], ['--help']]
+    cmd = [os.environ['PG_CONFIG'], '--help']
 
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
-    if b'postgrespro.ru' in p.communicate()[0]:
-        return True
-    else:
-        return False
+    return b'postgrespro.ru' in p.communicate()[0]
+
+ 
+def is_nls_enabled():
+    cmd = [os.environ['PG_CONFIG'], '--configure']
+
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    return b'enable-nls' in p.communicate()[0]
+
+
+def base36enc(number):
+    """Converts an integer to a base36 string."""
+    alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    base36 = ''
+    sign = ''
+
+    if number < 0:
+        sign = '-'
+        number = -number
+
+    if 0 <= number < len(alphabet):
+        return sign + alphabet[number]
+
+    while number != 0:
+        number, i = divmod(number, len(alphabet))
+        base36 = alphabet[i] + base36
+
+    return sign + base36
 
 
 class ProbackupException(Exception):
@@ -151,6 +175,7 @@ def slow_start(self, replica=False):
 class ProbackupTest(object):
     # Class attributes
     enterprise = is_enterprise()
+    enable_nls = is_nls_enabled()
 
     def __init__(self, *args, **kwargs):
         super(ProbackupTest, self).__init__(*args, **kwargs)
@@ -184,8 +209,8 @@ class ProbackupTest(object):
         self.test_env['LC_MESSAGES'] = 'C'
         self.test_env['LC_TIME'] = 'C'
 
-        self.gdb = 'PGPROBACKUP_GDB' in os.environ and \
-              os.environ['PGPROBACKUP_GDB'] == 'ON'
+        self.gdb = 'PGPROBACKUP_GDB' in self.test_env and \
+              self.test_env['PGPROBACKUP_GDB'] == 'ON'
 
         self.paranoia = 'PG_PROBACKUP_PARANOIA' in self.test_env and \
             self.test_env['PG_PROBACKUP_PARANOIA'] == 'ON'
@@ -217,10 +242,7 @@ class ProbackupTest(object):
         self.user = self.get_username()
         self.probackup_path = None
         if 'PGPROBACKUPBIN' in self.test_env:
-            if (
-                os.path.isfile(self.test_env["PGPROBACKUPBIN"]) and
-                os.access(self.test_env["PGPROBACKUPBIN"], os.X_OK)
-            ):
+            if shutil.which(self.test_env["PGPROBACKUPBIN"]):
                 self.probackup_path = self.test_env["PGPROBACKUPBIN"]
             else:
                 if self.verbose:
@@ -451,8 +473,8 @@ class ProbackupTest(object):
                 'GRANT EXECUTE ON FUNCTION pg_catalog.txid_current_snapshot() TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.txid_snapshot_xmax(txid_snapshot) TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() TO {0};'.format(role))
-        # >= 10
-        else:
+        # >= 10 && < 15
+        elif self.get_version(node) >= 100000 and self.get_version(node) < 150000:
             node.safe_psql(
                 'postgres',
                 'GRANT USAGE ON SCHEMA pg_catalog TO {0}; '
@@ -460,6 +482,22 @@ class ProbackupTest(object):
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_is_in_recovery() TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_start_backup(text, boolean, boolean) TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_stop_backup(boolean, boolean) TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_create_restore_point(text) TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_last_wal_replay_lsn() TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.txid_current() TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.txid_current_snapshot() TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.txid_snapshot_xmax(txid_snapshot) TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() TO {0};'.format(role))
+        # >= 15
+        else:
+            node.safe_psql(
+                'postgres',
+                'GRANT USAGE ON SCHEMA pg_catalog TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.current_setting(text) TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_is_in_recovery() TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_backup_start(text, boolean) TO {0}; '
+                'GRANT EXECUTE ON FUNCTION pg_catalog.pg_backup_stop(boolean) TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_create_restore_point(text) TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO {0}; '
                 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_last_wal_replay_lsn() TO {0}; '
@@ -814,7 +852,7 @@ class ProbackupTest(object):
             if self.verbose:
                 print(self.cmd)
             if gdb:
-                return GDBobj([binary_path] + command, self.verbose)
+                return GDBobj([binary_path] + command, self)
             if asynchronous:
                 return subprocess.Popen(
                     [binary_path] + command,
@@ -1668,8 +1706,18 @@ class ProbackupTest(object):
                 file_relpath = os.path.relpath(file_fullpath, pgdata)
                 directory_dict['files'][file_relpath] = {'is_datafile': False}
                 with open(file_fullpath, 'rb') as f:
-                    directory_dict['files'][file_relpath]['md5'] = hashlib.md5(f.read()).hexdigest()
-                    f.close()
+                    content = f.read()
+                    # truncate cfm's content's zero tail
+                    if file_relpath.endswith('.cfm'):
+                        zero64 = b"\x00"*64
+                        l = len(content)
+                        while l > 64:
+                            s = (l - 1) & ~63
+                            if content[s:l] != zero64[:l-s]:
+                                break
+                            l = s
+                        content = content[:l]
+                    directory_dict['files'][file_relpath]['md5'] = hashlib.md5(content).hexdigest()
 #                directory_dict['files'][file_relpath]['md5'] = hashlib.md5(
 #                    f = open(file_fullpath, 'rb').read()).hexdigest()
 
@@ -1865,22 +1913,34 @@ class ProbackupTest(object):
         self.assertFalse(fail, error_message)
 
     def gdb_attach(self, pid):
-        return GDBobj([str(pid)], self.verbose, attach=True)
+        return GDBobj([str(pid)], self, attach=True)
+
+    def _check_gdb_flag_or_skip_test(self):
+        if not self.gdb:
+            self.skipTest(
+                "Specify PGPROBACKUP_GDB and build without "
+                "optimizations for run this test"
+            )
 
 
 class GdbException(Exception):
-    def __init__(self, message=False):
+    def __init__(self, message="False"):
         self.message = message
 
     def __str__(self):
         return '\n ERROR: {0}\n'.format(repr(self.message))
 
 
-class GDBobj(ProbackupTest):
-    def __init__(self, cmd, verbose, attach=False):
-        self.verbose = verbose
+class GDBobj:
+    def __init__(self, cmd, env, attach=False):
+        self.verbose = env.verbose
         self.output = ''
 
+        # Check gdb flag is set up
+        if not env.gdb:
+            raise GdbException("No `PGPROBACKUP_GDB=on` is set, "
+                               "test should call ProbackupTest::check_gdb_flag_or_skip_test() on its start "
+                               "and be skipped")
         # Check gdb presense
         try:
             gdb_version, _ = subprocess.Popen(

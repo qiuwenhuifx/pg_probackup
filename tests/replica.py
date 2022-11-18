@@ -291,16 +291,6 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
 
         self.wait_until_replica_catch_with_master(master, replica)
 
-        master.pgbench_init(scale=5)
-        # Continuous making some changes on master,
-        # because WAL archiving on replica in idle DB in PostgreSQL is broken:
-        # replica will not archive the previous WAL until it receives new records in the next WAL file,
-        # this "lazy" archiving can be seen in src/backend/replication/walreceiver.c:XLogWalRcvWrite()
-        # (see !XLByteInSeg checking and XLogArchiveNotify() calling).
-        pgbench = master.pgbench(
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            options=['-T', '3', '-c', '1', '--no-vacuum'])
-
         backup_id = self.backup_node(
             backup_dir, 'replica', replica,
             options=[
@@ -308,9 +298,6 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
                 '--master-host=localhost',
                 '--master-db=postgres',
                 '--master-port={0}'.format(master.port)])
-
-        pgbench.wait()
-        pgbench.stdout.close()
 
         self.validate_pb(backup_dir, 'replica')
         self.assertEqual(
@@ -334,6 +321,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
         # Change data on master, make PAGE backup from replica,
         # restore taken backup and check that restored data equal
         # to original data
+        master.pgbench_init(scale=5)
+
         pgbench = master.pgbench(
             options=['-T', '30', '-c', '2', '--no-vacuum'])
 
@@ -550,11 +539,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
         start backup from replica, during backup promote replica
         check that backup is failed
         """
-        if not self.gdb:
-            self.skipTest(
-                "Specify PGPROBACKUP_GDB and build without "
-                "optimizations for run this test"
-            )
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -645,11 +631,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
     def test_replica_stop_lsn_null_offset(self):
         """
         """
-        if not self.gdb:
-            self.skipTest(
-                "Specify PGPROBACKUP_GDB and build without "
-                "optimizations for run this test"
-            )
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -733,11 +716,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
     def test_replica_stop_lsn_null_offset_next_record(self):
         """
         """
-        if not self.gdb:
-            self.skipTest(
-                "Specify PGPROBACKUP_GDB and build without "
-                "optimizations for run this test"
-            )
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -760,7 +740,6 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
 
         # freeze bgwriter to get rid of RUNNING XACTS records
         bgwriter_pid = master.auxiliary_pids[ProcessType.BackgroundWriter][0]
-        gdb_checkpointer = self.gdb_attach(bgwriter_pid)
 
         self.backup_node(backup_dir, 'master', master)
 
@@ -796,6 +775,7 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
                 '--stream'],
             gdb=True)
 
+        # Attention! this breakpoint is set to a probackup internal function, not a postgres core one
         gdb.set_breakpoint('pg_stop_backup')
         gdb.run_until_break()
         gdb.remove_all_breakpoints()
@@ -827,7 +807,7 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
             log_content)
 
         self.assertIn(
-            'LOG: stop_lsn: 0/4000000',
+            'INFO: stop_lsn: 0/4000000',
             log_content)
 
         self.assertTrue(self.show_pb(backup_dir, 'replica')[0]['status'] == 'DONE')
@@ -839,6 +819,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
     def test_archive_replica_null_offset(self):
         """
         """
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -1009,11 +991,8 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
         make archive master, take full and page archive backups from master,
         set replica, make archive backup from replica
         """
-        if not self.gdb:
-            self.skipTest(
-                "Specify PGPROBACKUP_GDB and build without "
-                "optimizations for run this test"
-            )
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -1115,11 +1094,7 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
     def test_start_stop_lsn_in_the_same_segno(self):
         """
         """
-        if not self.gdb:
-            self.skipTest(
-                "Specify PGPROBACKUP_GDB and build without "
-                "optimizations for run this test"
-            )
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         master = self.make_simple_node(
@@ -1142,7 +1117,6 @@ class ReplicaTest(ProbackupTest, unittest.TestCase):
 
         # freeze bgwriter to get rid of RUNNING XACTS records
         bgwriter_pid = master.auxiliary_pids[ProcessType.BackgroundWriter][0]
-        gdb_checkpointer = self.gdb_attach(bgwriter_pid)
 
         self.backup_node(backup_dir, 'master', master, options=['--stream'])
 

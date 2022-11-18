@@ -6,7 +6,7 @@
 `pg_probackup` is a utility to manage backup and recovery of PostgreSQL database clusters. It is designed to perform periodic backups of the PostgreSQL instance that enable you to restore the server in case of a failure.
 
 The utility is compatible with:
-* PostgreSQL 9.6, 10, 11, 12, 13, 14;
+* PostgreSQL 9.6, 10, 11, 12, 13, 14, 15;
 
 As compared to other backup solutions, `pg_probackup` offers the following benefits that can help you implement different backup strategies and deal with large amounts of data:
 * Incremental backup: page-level incremental backup allows you to save disk space, speed up backup and restore. With three different incremental modes, you can plan the backup strategy in accordance with your data flow.
@@ -41,9 +41,9 @@ Regardless of the chosen backup type, all backups taken with `pg_probackup` supp
 ## ptrack support
 
 `PTRACK` backup support provided via following options:
-* vanilla PostgreSQL 11, 12, 13, 14 with [ptrack extension](https://github.com/postgrespro/ptrack)
-* Postgres Pro Standard 11, 12, 13
-* Postgres Pro Enterprise 11, 12, 13
+* vanilla PostgreSQL 11, 12, 13, 14, 15 with [ptrack extension](https://github.com/postgrespro/ptrack)
+* Postgres Pro Standard 11, 12, 13, 14
+* Postgres Pro Enterprise 11, 12, 13, 14
 
 ## Limitations
 
@@ -66,7 +66,7 @@ For detailed release plans check [Milestones](https://github.com/postgrespro/pg_
 
 ## Installation and Setup
 ### Windows Installation
-Installers are available in release **assets**. [Latests](https://github.com/postgrespro/pg_probackup/releases/2.4.15).
+Installers are available in release **assets**. [Latests](https://github.com/postgrespro/pg_probackup/releases/latest).
 
 ### Linux Installation
 #### pg_probackup for vanilla PostgreSQL
@@ -137,8 +137,8 @@ sudo apt-get install pg_probackup-{14,13,12,11,10,9.6}-debuginfo
 #DEB Ubuntu|Debian Packages
 sudo sh -c 'echo "deb [arch=amd64] https://repo.postgrespro.ru/pg_probackup-forks/deb/ $(lsb_release -cs) main-$(lsb_release -cs)" > /etc/apt/sources.list.d/pg_probackup-forks.list'
 sudo wget -O - https://repo.postgrespro.ru/pg_probackup-forks/keys/GPG-KEY-PG_PROBACKUP | sudo apt-key add - && sudo apt-get update
-sudo apt-get install pg-probackup-{std,ent}-{13,12,11,10,9.6}
-sudo apt-get install pg-probackup-{std,ent}-{13,12,11,10,9.6}-dbg
+sudo apt-get install pg-probackup-{std,ent}-{14,13,12,11,10,9.6}
+sudo apt-get install pg-probackup-{std,ent}-{14,13,12,11,10,9.6}-dbg
 
 #DEB Astra Linix Orel
 sudo sh -c 'echo "deb [arch=amd64] https://repo.postgrespro.ru/pg_probackup-forks/deb/ stretch main-stretch" > /etc/apt/sources.list.d/pg_probackup.list'
@@ -148,35 +148,35 @@ sudo apt-get install pg-probackup-{std,ent}-{12,11,10,9.6}{-dbg,}
 
 #RPM Centos Packages
 rpm -ivh https://repo.postgrespro.ru/pg_probackup-forks/keys/pg_probackup-repo-forks-centos.noarch.rpm
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 
 #RPM RHEL Packages
 rpm -ivh https://repo.postgrespro.ru/pg_probackup-forks/keys/pg_probackup-repo-forks-rhel.noarch.rpm
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 
 #RPM Oracle Linux Packages
 rpm -ivh https://repo.postgrespro.ru/pg_probackup-forks/keys/pg_probackup-repo-forks-oraclelinux.noarch.rpm
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-yum install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+yum install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 
 #RPM ALT Linux 7
 sudo sh -c 'echo "rpm https://repo.postgrespro.ru/pg_probackup-forks/rpm/latest/altlinux-p7 x86_64 forks" > /etc/apt/sources.list.d/pg_probackup_forks.list'
 sudo apt-get update
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 
 #RPM ALT Linux 8
 sudo sh -c 'echo "rpm https://repo.postgrespro.ru/pg_probackup-forks/rpm/latest/altlinux-p8 x86_64 forks" > /etc/apt/sources.list.d/pg_probackup_forks.list'
 sudo apt-get update
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 
 #RPM ALT Linux 9
 sudo sh -c 'echo "rpm https://repo.postgrespro.ru/pg_probackup-forks/rpm/latest/altlinux-p9 x86_64 forks" > /etc/apt/sources.list.d/pg_probackup_forks.list' && sudo apt-get update
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}
-sudo apt-get install pg_probackup-{std,ent}-{13,12,11,10,9.6}-debuginfo
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}
+sudo apt-get install pg_probackup-{std,ent}-{14,13,12,11,10,9.6}-debuginfo
 ```
 
 Once you have `pg_probackup` installed, complete [the setup](https://postgrespro.github.io/pg_probackup/#pbk-install-and-setup).
@@ -224,3 +224,17 @@ Postgres Professional, Moscow, Russia.
 ## Credits
 
 `pg_probackup` utility is based on `pg_arman`, that was originally written by NTT and then developed and maintained by Michael Paquier.
+
+
+### Localization files (*.po)
+
+Description of how to add new translation languages.
+1. Add a flag --enable-nls in configure.
+2. Build postgres.
+3. Adding to nls.mk in folder pg_probackup required files in GETTEXT_FILES.
+4. In folder pg_probackup do 'make update-po'.
+5. As a result, the progname.pot file will be created. Copy the content and add it to the file with the desired language.
+6. Adding to nls.mk in folder pg_probackup required language in AVAIL_LANGUAGES.
+
+For more information, follow the link below:
+https://postgrespro.ru/docs/postgresql/12/nls-translator

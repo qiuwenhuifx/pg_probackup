@@ -228,6 +228,8 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         Check pg_stop_backup_timeout, needed backup_timeout
         Fixed in commit d84d79668b0c139 and assert fixed by ptrack 1.7
         """
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -248,6 +250,7 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                     "--log-level-file=LOG"],
                 gdb=True)
 
+        # Attention! this breakpoint has been set on internal probackup function, not on a postgres core one
         gdb.set_breakpoint('pg_stop_backup')
         gdb.run_until_break()
 
@@ -290,6 +293,8 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         Check pg_stop_backup_timeout, libpq-timeout requested.
         Fixed in commit d84d79668b0c139 and assert fixed by ptrack 1.7
         """
+        self._check_gdb_flag_or_skip_test()
+
         fname = self.id().split('.')[3]
         backup_dir = os.path.join(self.tmp_path, module_name, fname, 'backup')
         node = self.make_simple_node(
@@ -310,10 +315,11 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
                     "--log-level-file=info"],
                 gdb=True)
 
+        # Attention! this breakpoint has been set on internal probackup function, not on a postgres core one
         gdb.set_breakpoint('pg_stop_backup')
         gdb.run_until_break()
 
-        self.set_auto_conf(node, {'archive_command': "'exit 1'"})
+        self.set_auto_conf(node, {'archive_command': 'exit 1'})
         node.reload()
 
         os.environ["PGAPPNAME"] = "foo"
@@ -337,9 +343,14 @@ class ArchiveTest(ProbackupTest, unittest.TestCase):
         with open(log_file, 'r') as f:
             log_content = f.read()
 
-        self.assertIn(
-            "ERROR: pg_stop_backup doesn't answer in 60 seconds, cancel it",
-            log_content)
+        if self.get_version(node) < 150000:
+            self.assertIn(
+                "ERROR: pg_stop_backup doesn't answer in 60 seconds, cancel it",
+                log_content)
+        else:
+            self.assertIn(
+                "ERROR: pg_backup_stop doesn't answer in 60 seconds, cancel it",
+                log_content)
 
         log_file = os.path.join(node.logs_dir, 'postgresql.log')
         with open(log_file, 'r') as f:

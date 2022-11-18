@@ -3,7 +3,7 @@
  * archive.c: -  pg_probackup specific archive commands for archive backups.
  *
  *
- * Portions Copyright (c) 2018-2021, Postgres Professional
+ * Portions Copyright (c) 2018-2022, Postgres Professional
  *
  *-------------------------------------------------------------------------
  */
@@ -361,7 +361,7 @@ push_file(WALSegno *xlogfile, const char *archive_status_dir,
 		canonicalize_path(wal_file_ready);
 		canonicalize_path(wal_file_done);
 		/* It is ok to rename status file in archive_status directory */
-		elog(VERBOSE, "Rename \"%s\" to \"%s\"", wal_file_ready, wal_file_done);
+		elog(LOG, "Rename \"%s\" to \"%s\"", wal_file_ready, wal_file_done);
 
 		/* do not error out, if rename failed */
 		if (fio_rename(wal_file_ready, wal_file_done, FIO_DB_HOST) < 0)
@@ -505,15 +505,15 @@ push_file_internal_uncompressed(const char *wal_file_name, const char *pg_xlog_d
 	}
 
 part_opened:
-	elog(VERBOSE, "Temp WAL file successfully created: \"%s\"", to_fullpath_part);
+	elog(LOG, "Temp WAL file successfully created: \"%s\"", to_fullpath_part);
 	/* Check if possible to skip copying */
 	if (fileExists(to_fullpath, FIO_BACKUP_HOST))
 	{
 		pg_crc32 crc32_src;
 		pg_crc32 crc32_dst;
 
-		crc32_src = fio_get_crc32(from_fullpath, FIO_DB_HOST, false);
-		crc32_dst = fio_get_crc32(to_fullpath, FIO_BACKUP_HOST, false);
+		crc32_src = fio_get_crc32(from_fullpath, FIO_DB_HOST, false, false);
+		crc32_dst = fio_get_crc32(to_fullpath, FIO_BACKUP_HOST, false, false);
 
 		if (crc32_src == crc32_dst)
 		{
@@ -595,7 +595,7 @@ part_opened:
 						to_fullpath_part, strerror(errno));
 	}
 
-	elog(VERBOSE, "Rename \"%s\" to \"%s\"", to_fullpath_part, to_fullpath);
+	elog(LOG, "Rename \"%s\" to \"%s\"", to_fullpath_part, to_fullpath);
 
 	//copy_file_attributes(from_path, FIO_DB_HOST, to_path_temp, FIO_BACKUP_HOST, true);
 
@@ -752,7 +752,7 @@ push_file_internal_gz(const char *wal_file_name, const char *pg_xlog_dir,
 	}
 
 part_opened:
-	elog(VERBOSE, "Temp WAL file successfully created: \"%s\"", to_fullpath_gz_part);
+	elog(LOG, "Temp WAL file successfully created: \"%s\"", to_fullpath_gz_part);
 	/* Check if possible to skip copying,
 	 */
 	if (fileExists(to_fullpath_gz, FIO_BACKUP_HOST))
@@ -760,9 +760,8 @@ part_opened:
 		pg_crc32 crc32_src;
 		pg_crc32 crc32_dst;
 
-		/* TODO: what if one of them goes missing? */
-		crc32_src = fio_get_crc32(from_fullpath, FIO_DB_HOST, false);
-		crc32_dst = fio_get_crc32(to_fullpath_gz, FIO_BACKUP_HOST, true);
+		crc32_src = fio_get_crc32(from_fullpath, FIO_DB_HOST, false, false);
+		crc32_dst = fio_get_crc32(to_fullpath_gz, FIO_BACKUP_HOST, true, false);
 
 		if (crc32_src == crc32_dst)
 		{
@@ -844,7 +843,7 @@ part_opened:
 					to_fullpath_gz_part, strerror(errno));
 	}
 
-	elog(VERBOSE, "Rename \"%s\" to \"%s\"",
+	elog(LOG, "Rename \"%s\" to \"%s\"",
 			to_fullpath_gz_part, to_fullpath_gz);
 
 	//copy_file_attributes(from_path, FIO_DB_HOST, to_path_temp, FIO_BACKUP_HOST, true);
@@ -1155,7 +1154,7 @@ do_archive_get(InstanceState *instanceState, InstanceConfig *instance, const cha
 		if (get_wal_file(wal_file_name, backup_wal_file_path, absolute_wal_file_path, false))
 		{
 			fail_count = 0;
-			elog(INFO, "pg_probackup archive-get copied WAL file %s", wal_file_name);
+			elog(LOG, "pg_probackup archive-get copied WAL file %s", wal_file_name);
 			n_fetched++;
 			break;
 		}
@@ -1263,6 +1262,7 @@ uint32 run_wal_prefetch(const char *prefetch_dir, const char *archive_dir,
 
 			arg->thread_num = i+1;
 			arg->files = batch_files;
+			arg->n_fetched = 0;
 		}
 
 		/* Run threads */
@@ -1375,11 +1375,11 @@ get_wal_file(const char *filename, const char *from_fullpath,
 #ifdef HAVE_LIBZ
 		/* If requested file is regular WAL segment, then try to open it with '.gz' suffix... */
 		if (IsXLogFileName(filename))
-			rc = fio_send_file_gz(from_fullpath_gz, to_fullpath, out, &errmsg);
+			rc = fio_send_file_gz(from_fullpath_gz, out, &errmsg);
 		if (rc == FILE_MISSING)
 #endif
 			/* ... failing that, use uncompressed */
-			rc = fio_send_file(from_fullpath, to_fullpath, out, NULL, &errmsg);
+			rc = fio_send_file(from_fullpath, out, false, NULL, &errmsg);
 
 		/* When not in prefetch mode, try to use partial file */
 		if (rc == FILE_MISSING && !prefetch_mode && IsXLogFileName(filename))
@@ -1389,13 +1389,13 @@ get_wal_file(const char *filename, const char *from_fullpath,
 #ifdef HAVE_LIBZ
 			/* '.gz.partial' goes first ... */
 			snprintf(from_partial, sizeof(from_partial), "%s.gz.partial", from_fullpath);
-			rc = fio_send_file_gz(from_partial, to_fullpath, out, &errmsg);
+			rc = fio_send_file_gz(from_partial, out, &errmsg);
 			if (rc == FILE_MISSING)
 #endif
 			{
 				/* ... failing that, use '.partial' */
 				snprintf(from_partial, sizeof(from_partial), "%s.partial", from_fullpath);
-				rc = fio_send_file(from_partial, to_fullpath, out, NULL, &errmsg);
+				rc = fio_send_file(from_partial, out, false, NULL, &errmsg);
 			}
 
 			if (rc == SEND_OK)
@@ -1511,7 +1511,7 @@ get_wal_file_internal(const char *from_path, const char *to_path, FILE *out,
 	char    *buf = pgut_malloc(OUT_BUF_SIZE); /* 1MB buffer */
 	int      exit_code = 0;
 
-	elog(VERBOSE, "Attempting to %s WAL file '%s'",
+	elog(LOG, "Attempting to %s WAL file '%s'",
 			is_decompress ? "open compressed" : "open", from_path);
 
 	/* open source file for read */

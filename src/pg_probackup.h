@@ -50,6 +50,12 @@
 #include <pthread.h>
 #endif
 
+#if PG_VERSION_NUM >= 150000
+// _() is explicitly undefined in libpq-int.h
+// https://github.com/postgres/postgres/commit/28ec316787674dd74d00b296724a009b6edc2fb0
+#define _(s) gettext(s)
+#endif
+
 /* Wrap the code that we're going to delete after refactoring in this define*/
 #define REFACTORE_ME
 
@@ -209,6 +215,7 @@ typedef enum CompressAlg
 
 typedef enum ForkName
 {
+	none,
 	vm,
 	fsm,
 	cfm,
@@ -338,11 +345,11 @@ typedef enum ShowFormat
 #define BYTES_INVALID		(-1) /* file didn`t changed since previous backup, DELTA backup do not rely on it */
 #define FILE_NOT_FOUND		(-2) /* file disappeared during backup */
 #define BLOCKNUM_INVALID	(-1)
-#define PROGRAM_VERSION	"2.5.5"
+#define PROGRAM_VERSION	"2.5.10"
 
 /* update when remote agent API or behaviour changes */
-#define AGENT_PROTOCOL_VERSION 20501
-#define AGENT_PROTOCOL_VERSION_STR "2.5.1"
+#define AGENT_PROTOCOL_VERSION 20509
+#define AGENT_PROTOCOL_VERSION_STR "2.5.9"
 
 /* update only when changing storage format */
 #define STORAGE_FORMAT_VERSION "2.4.4"
@@ -450,7 +457,10 @@ struct pgBackup
 {
 	BackupMode		backup_mode; /* Mode - one of BACKUP_MODE_xxx above*/
 	time_t			backup_id;	 /* Identifier of the backup.
-								  * Currently it's the same as start_time */
+								  * By default it's the same as start_time
+								  * but can be increased if same backup_id
+								  * already exists. It can be also set by
+								  * start_time parameter */
 	BackupStatus	status;		/* Status - one of BACKUP_STATUS_xxx above*/
 	TimeLineID		tli; 		/* timeline of start and stop backup lsns */
 	XLogRecPtr		start_lsn;	/* backup's starting transaction log location */
@@ -566,6 +576,8 @@ typedef struct pgRestoreParams
 	/* options for partial restore */
 	PartialRestoreType partial_restore_type;
 	parray *partial_db_list;
+	
+	char* waldir;
 } pgRestoreParams;
 
 /* Options needed for set-backup command */
@@ -787,7 +799,7 @@ extern bool perm_slot;
 extern bool		smooth_checkpoint;
 
 /* remote probackup options */
-extern char* remote_agent;
+extern bool remote_agent;
 
 extern bool exclusive_backup;
 
@@ -840,7 +852,7 @@ extern char** commands_args;
 
 /* in backup.c */
 extern int do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
-					 bool no_validate, bool no_sync, bool backup_logs);
+					 bool no_validate, bool no_sync, bool backup_logs, time_t start_time);
 extern void do_checkdb(bool need_amcheck, ConnectionOptions conn_opt,
 				  char *pgdata);
 extern BackupMode parse_backup_mode(const char *value);
@@ -876,6 +888,11 @@ extern bool tliIsPartOfHistory(const parray *timelines, TimeLineID tli);
 extern DestDirIncrCompatibility check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
 																IncrRestoreMode incremental_mode);
 
+/* in remote.c */
+extern void check_remote_agent_compatibility(int agent_version,
+											 char *compatibility_str, size_t compatibility_str_max_size);
+extern size_t prepare_compatibility_str(char* compatibility_buf, size_t compatibility_buf_size);
+
 /* in merge.c */
 extern void do_merge(InstanceState *instanceState, time_t backup_id, bool no_validate, bool no_sync);
 extern void merge_backups(pgBackup *backup, pgBackup *next_backup);
@@ -905,6 +922,8 @@ extern InstanceConfig *readInstanceConfigFile(InstanceState *instanceState);
 /* in show.c */
 extern int do_show(CatalogState *catalogState, InstanceState *instanceState,
 				   time_t requested_backup_id, bool show_archive);
+extern void memorize_environment_locale(void);
+extern void free_environment_locale(void);
 
 /* in delete.c */
 extern void do_delete(InstanceState *instanceState, time_t backup_id);
@@ -981,7 +1000,7 @@ extern void write_backup_filelist(pgBackup *backup, parray *files,
 								  const char *root, parray *external_list, bool sync);
 
 
-extern void pgBackupCreateDir(pgBackup *backup, const char *backup_instance_path);
+extern void pgBackupInitDir(pgBackup *backup, const char *backup_instance_path);
 extern void pgNodeInit(PGNodeInfo *node);
 extern void pgBackupInit(pgBackup *backup);
 extern void pgBackupFree(void *backup);
@@ -1010,8 +1029,9 @@ extern CompressAlg parse_compress_alg(const char *arg);
 extern const char* deparse_compress_alg(int alg);
 
 /* in dir.c */
-extern bool get_control_value(const char *str, const char *name,
-				  char *value_str, int64 *value_int64, bool is_mandatory);
+extern bool get_control_value_int64(const char *str, const char *name, int64 *value_int64, bool is_mandatory);
+extern bool get_control_value_str(const char *str, const char *name,
+                                  char *value_str, size_t value_str_size, bool is_mandatory);
 extern void dir_list_file(parray *files, const char *root, bool exclude,
 						  bool follow_symlink, bool add_root, bool backup_logs,
 						  bool skip_hidden, int external_dir_num, fio_location location);
@@ -1022,7 +1042,8 @@ extern void create_data_directories(parray *dest_files,
 										const char *backup_dir,
 										bool extract_tablespaces,
 										bool incremental,
-										fio_location location);
+										fio_location location,
+										const char *waldir_path);
 
 extern void read_tablespace_map(parray *links, const char *backup_dir);
 extern void opt_tablespace_map(ConfigOption *opt, const char *arg);
@@ -1061,6 +1082,7 @@ extern void fio_pgFileDelete(pgFile *file, const char *full_path);
 extern void pgFileFree(void *file);
 
 extern pg_crc32 pgFileGetCRC(const char *file_path, bool use_crc32c, bool missing_ok);
+extern pg_crc32 pgFileGetCRCTruncated(const char *file_path, bool use_crc32c, bool missing_ok);
 extern pg_crc32 pgFileGetCRCgz(const char *file_path, bool use_crc32c, bool missing_ok);
 
 extern int pgFileMapComparePath(const void *f1, const void *f2);
@@ -1076,6 +1098,7 @@ extern int pgCompareString(const void *str1, const void *str2);
 extern int pgPrefixCompareString(const void *str1, const void *str2);
 extern int pgCompareOid(const void *f1, const void *f2);
 extern void pfilearray_clear_locks(parray *file_list);
+extern bool set_forkname(pgFile *file);
 
 /* in data.c */
 extern bool check_data_file(ConnectionArgs *arguments, pgFile *file,
@@ -1158,7 +1181,6 @@ extern uint64 get_system_identifier(const char *pgdata_path, fio_location locati
 extern uint64 get_remote_system_identifier(PGconn *conn);
 extern uint32 get_data_checksum_version(bool safe);
 extern pg_crc32c get_pgcontrol_checksum(const char *pgdata_path);
-extern DBState get_system_dbstate(const char *pgdata_path, fio_location location);
 extern uint32 get_xlog_seg_size(const char *pgdata_path);
 extern void get_redo(const char *pgdata_path, fio_location pgdata_location, RedoParams *redo);
 extern void set_min_recovery_point(pgFile *file, const char *backup_path,
@@ -1223,9 +1245,11 @@ extern int fio_copy_pages(const char *to_fullpath, const char *from_fullpath, pg
 	                      XLogRecPtr horizonLsn, int calg, int clevel, uint32 checksum_version,
 	                      bool use_pagemap, BlockNumber *err_blknum, char **errormsg);
 /* return codes for fio_send_pages */
-extern int fio_send_file_gz(const char *from_fullpath, const char *to_fullpath, FILE* out, char **errormsg);
-extern int fio_send_file(const char *from_fullpath, const char *to_fullpath, FILE* out,
+extern int fio_send_file_gz(const char *from_fullpath, FILE* out, char **errormsg);
+extern int fio_send_file(const char *from_fullpath, FILE* out, bool cut_zero_tail,
 														pgFile *file, char **errormsg);
+extern int fio_send_file_local(const char *from_fullpath, FILE* out, bool cut_zero_tail,
+						 pgFile *file, char **errormsg);
 
 extern void fio_list_dir(parray *files, const char *root, bool exclude, bool follow_symlink,
 						 bool add_root, bool backup_logs, bool skip_hidden, int external_dir_num);

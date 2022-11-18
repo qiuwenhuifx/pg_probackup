@@ -3,11 +3,12 @@
  * dir.c: directory operation utility.
  *
  * Portions Copyright (c) 2009-2013, NIPPON TELEGRAPH AND TELEPHONE CORPORATION
- * Portions Copyright (c) 2015-2019, Postgres Professional
+ * Portions Copyright (c) 2015-2022, Postgres Professional
  *
  *-------------------------------------------------------------------------
  */
 
+#include <assert.h>
 #include "pg_probackup.h"
 #include "utils/file.h"
 
@@ -129,6 +130,9 @@ static void dir_list_file_internal(parray *files, pgFile *parent, const char *pa
 static void opt_path_map(ConfigOption *opt, const char *arg,
 						 TablespaceList *list, const char *type);
 static void cleanup_tablespace(const char *path);
+
+static void control_string_bad_format(const char* str);
+
 
 /* Tablespace mapping */
 static TablespaceList tablespace_dirs = {NULL, NULL};
@@ -256,137 +260,6 @@ delete_file:
 		elog(ERROR, "Cannot remove file \"%s\": %s", full_path,
 			strerror(errno));
 	}
-}
-
-/*
- * Read the local file to compute its CRC.
- * We cannot make decision about file decompression because
- * user may ask to backup already compressed files and we should be
- * obvious about it.
- */
-pg_crc32
-pgFileGetCRC(const char *file_path, bool use_crc32c, bool missing_ok)
-{
-	FILE	   *fp;
-	pg_crc32	crc = 0;
-	char	   *buf;
-	size_t		len = 0;
-
-	INIT_FILE_CRC32(use_crc32c, crc);
-
-	/* open file in binary read mode */
-	fp = fopen(file_path, PG_BINARY_R);
-	if (fp == NULL)
-	{
-		if (errno == ENOENT)
-		{
-			if (missing_ok)
-			{
-				FIN_FILE_CRC32(use_crc32c, crc);
-				return crc;
-			}
-		}
-
-		elog(ERROR, "Cannot open file \"%s\": %s",
-			file_path, strerror(errno));
-	}
-
-	/* disable stdio buffering */
-	setvbuf(fp, NULL, _IONBF, BUFSIZ);
-	buf = pgut_malloc(STDIO_BUFSIZE);
-
-	/* calc CRC of file */
-	for (;;)
-	{
-		if (interrupted)
-			elog(ERROR, "interrupted during CRC calculation");
-
-		len = fread(buf, 1, STDIO_BUFSIZE, fp);
-
-		if (ferror(fp))
-			elog(ERROR, "Cannot read \"%s\": %s", file_path, strerror(errno));
-
-		/* update CRC */
-		COMP_FILE_CRC32(use_crc32c, crc, buf, len);
-
-		if (feof(fp))
-			break;
-	}
-
-	FIN_FILE_CRC32(use_crc32c, crc);
-	fclose(fp);
-	pg_free(buf);
-
-	return crc;
-}
-
-/*
- * Read the local file to compute its CRC.
- * We cannot make decision about file decompression because
- * user may ask to backup already compressed files and we should be
- * obvious about it.
- */
-pg_crc32
-pgFileGetCRCgz(const char *file_path, bool use_crc32c, bool missing_ok)
-{
-	gzFile    fp;
-	pg_crc32  crc = 0;
-	int       len = 0;
-	int       err;
-	char	 *buf;
-
-	INIT_FILE_CRC32(use_crc32c, crc);
-
-	/* open file in binary read mode */
-	fp = gzopen(file_path, PG_BINARY_R);
-	if (fp == NULL)
-	{
-		if (errno == ENOENT)
-		{
-			if (missing_ok)
-			{
-				FIN_FILE_CRC32(use_crc32c, crc);
-				return crc;
-			}
-		}
-
-		elog(ERROR, "Cannot open file \"%s\": %s",
-			file_path, strerror(errno));
-	}
-
-	buf = pgut_malloc(STDIO_BUFSIZE);
-
-	/* calc CRC of file */
-	for (;;)
-	{
-		if (interrupted)
-			elog(ERROR, "interrupted during CRC calculation");
-
-		len = gzread(fp, buf, STDIO_BUFSIZE);
-
-		if (len <= 0)
-		{
-			/* we either run into eof or error */
-			if (gzeof(fp))
-				break;
-			else
-			{
-				const char *err_str = NULL;
-
-                err_str = gzerror(fp, &err);
-                elog(ERROR, "Cannot read from compressed file %s", err_str);
-			}
-		}
-
-		/* update CRC */
-		COMP_FILE_CRC32(use_crc32c, crc, buf, len);
-	}
-
-	FIN_FILE_CRC32(use_crc32c, crc);
-	gzclose(fp);
-	pg_free(buf);
-
-	return crc;
 }
 
 void
@@ -636,7 +509,7 @@ dir_check_file(pgFile *file, bool backup_logs)
 						   pgdata_exclude_files_non_exclusive[i]) == 0)
 				{
 					/* Skip */
-					elog(VERBOSE, "Excluding file: %s", file->name);
+					elog(LOG, "Excluding file: %s", file->name);
 					return CHECK_FALSE;
 				}
 		}
@@ -645,7 +518,7 @@ dir_check_file(pgFile *file, bool backup_logs)
 			if (strcmp(file->rel_path, pgdata_exclude_files[i]) == 0)
 			{
 				/* Skip */
-				elog(VERBOSE, "Excluding file: %s", file->name);
+				elog(LOG, "Excluding file: %s", file->name);
 				return CHECK_FALSE;
 			}
 	}
@@ -665,7 +538,7 @@ dir_check_file(pgFile *file, bool backup_logs)
 			/* exclude by dirname */
 			if (strcmp(file->name, pgdata_exclude_dir[i]) == 0)
 			{
-				elog(VERBOSE, "Excluding directory content: %s", file->rel_path);
+				elog(LOG, "Excluding directory content: %s", file->rel_path);
 				return CHECK_EXCLUDE_FALSE;
 			}
 		}
@@ -675,7 +548,7 @@ dir_check_file(pgFile *file, bool backup_logs)
 			if (strcmp(file->rel_path, PG_LOG_DIR) == 0)
 			{
 				/* Skip */
-				elog(VERBOSE, "Excluding directory content: %s", file->rel_path);
+				elog(LOG, "Excluding directory content: %s", file->rel_path);
 				return CHECK_EXCLUDE_FALSE;
 			}
 		}
@@ -754,59 +627,10 @@ dir_check_file(pgFile *file, bool backup_logs)
 			return CHECK_FALSE;
 		else if (isdigit(file->name[0]))
 		{
-			char	   *fork_name;
-			int			len;
-			char		suffix[MAXPGPATH];
+			set_forkname(file);
 
-			fork_name = strstr(file->name, "_");
-			if (fork_name)
-			{
-				/* Auxiliary fork of the relfile */
-				if (strcmp(fork_name, "_vm") == 0)
-					file->forkName = vm;
-
-				else if (strcmp(fork_name, "_fsm") == 0)
-					file->forkName = fsm;
-
-				else if (strcmp(fork_name, "_cfm") == 0)
-					file->forkName = cfm;
-
-				else if (strcmp(fork_name, "_ptrack") == 0)
-					file->forkName = ptrack;
-
-				else if (strcmp(fork_name, "_init") == 0)
-					file->forkName = init;
-
-				// extract relOid for certain forks
-				if (file->forkName == vm ||
-					file->forkName == fsm ||
-					file->forkName == init ||
-					file->forkName == cfm)
-				{
-					// sanity
-					if (sscanf(file->name, "%u_*", &(file->relOid)) != 1)
-						file->relOid = 0;
-				}
-
-				/* Do not backup ptrack files */
-				if (file->forkName == ptrack)
-					return CHECK_FALSE;
-			}
-			else
-			{
-
-				len = strlen(file->name);
-				/* reloid.cfm */
-				if (len > 3 && strcmp(file->name + len - 3, "cfm") == 0)
-					return CHECK_TRUE;
-
-				sscanf_res = sscanf(file->name, "%u.%d.%s", &(file->relOid),
-									&(file->segno), suffix);
-				if (sscanf_res == 0)
-					elog(ERROR, "Cannot parse file name \"%s\"", file->name);
-				else if (sscanf_res == 1 || sscanf_res == 2)
-					file->is_datafile = true;
-			}
+			if (file->forkName == ptrack) /* Compatibility with left-overs from ptrack1 */
+				return CHECK_FALSE;
 		}
 	}
 
@@ -1036,12 +860,19 @@ opt_externaldir_map(ConfigOption *opt, const char *arg)
  */
 void
 create_data_directories(parray *dest_files, const char *data_dir, const char *backup_dir,
-						bool extract_tablespaces, bool incremental, fio_location location)
+						bool extract_tablespaces, bool incremental, fio_location location, 
+						const char* waldir_path)
 {
 	int			i;
 	parray		*links = NULL;
 	mode_t		pg_tablespace_mode = DIR_PERMISSION;
 	char		to_path[MAXPGPATH];
+
+	if (waldir_path && !dir_is_empty(waldir_path, location))
+	{
+		elog(ERROR, "WAL directory location is not empty: \"%s\"", waldir_path);
+	}
+
 
 	/* get tablespace map */
 	if (extract_tablespaces)
@@ -1107,6 +938,27 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
 		/* skip external directory content */
 		if (dir->external_dir_num != 0)
 			continue;
+		/* Create WAL directory and symlink if waldir_path is setting */
+		if (waldir_path && strcmp(dir->rel_path, PG_XLOG_DIR) == 0) {
+			/* get full path to PG_XLOG_DIR */
+
+			join_path_components(to_path, data_dir, PG_XLOG_DIR);
+
+			elog(VERBOSE, "Create directory \"%s\" and symbolic link \"%s\"",
+				waldir_path, to_path);
+
+			/* create tablespace directory from waldir_path*/
+			fio_mkdir(waldir_path, pg_tablespace_mode, location);
+
+			/* create link to linked_path */
+			if (fio_symlink(waldir_path, to_path, incremental, location) < 0)
+				elog(ERROR, "Could not create symbolic link \"%s\": %s",
+					to_path, strerror(errno));
+
+			continue;
+
+
+		}
 
 		/* tablespace_map exists */
 		if (links)
@@ -1134,7 +986,7 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
 
 					join_path_components(to_path, data_dir, dir->rel_path);
 
-					elog(VERBOSE, "Create directory \"%s\" and symbolic link \"%s\"",
+					elog(LOG, "Create directory \"%s\" and symbolic link \"%s\"",
 							 linked_path, to_path);
 
 					/* create tablespace directory */
@@ -1151,7 +1003,7 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
 		}
 
 		/* This is not symlink, create directory */
-		elog(VERBOSE, "Create directory \"%s\"", dir->rel_path);
+		elog(LOG, "Create directory \"%s\"", dir->rel_path);
 
 		join_path_components(to_path, data_dir, dir->rel_path);
 
@@ -1467,7 +1319,7 @@ get_external_remap(char *current_dir)
 	return current_dir;
 }
 
-/* Parsing states for get_control_value() */
+/* Parsing states for get_control_value_str() */
 #define CONTROL_WAIT_NAME			1
 #define CONTROL_INNAME				2
 #define CONTROL_WAIT_COLON			3
@@ -1481,26 +1333,62 @@ get_external_remap(char *current_dir)
  * The line has the following format:
  *   {"name1":"value1", "name2":"value2"}
  *
- * The value will be returned to "value_str" as string if it is not NULL. If it
- * is NULL the value will be returned to "value_int64" as int64.
+ * The value will be returned in "value_int64" as int64.
+ *
+ * Returns true if the value was found in the line and parsed.
+ */
+bool
+get_control_value_int64(const char *str, const char *name, int64 *value_int64, bool is_mandatory)
+{
+
+	char buf_int64[32];
+
+	assert(value_int64);
+
+    /* Set default value */
+    *value_int64 = 0;
+
+	if (!get_control_value_str(str, name, buf_int64, sizeof(buf_int64), is_mandatory))
+		return false;
+
+	if (!parse_int64(buf_int64, value_int64, 0))
+	{
+		/* We assume that too big value is -1 */
+		if (errno == ERANGE)
+			*value_int64 = BYTES_INVALID;
+		else
+			control_string_bad_format(str);
+        return false;
+	}
+
+	return true;
+}
+
+/*
+ * Get value from json-like line "str" of backup_content.control file.
+ *
+ * The line has the following format:
+ *   {"name1":"value1", "name2":"value2"}
+ *
+ * The value will be returned to "value_str" as string.
  *
  * Returns true if the value was found in the line.
  */
+
 bool
-get_control_value(const char *str, const char *name,
-				  char *value_str, int64 *value_int64, bool is_mandatory)
+get_control_value_str(const char *str, const char *name,
+                      char *value_str, size_t value_str_size, bool is_mandatory)
 {
 	int			state = CONTROL_WAIT_NAME;
 	char	   *name_ptr = (char *) name;
 	char	   *buf = (char *) str;
-	char		buf_int64[32],	/* Buffer for "value_int64" */
-			   *buf_int64_ptr = buf_int64;
+	char 	   *const value_str_start = value_str;
 
-	/* Set default values */
-	if (value_str)
-		*value_str = '\0';
-	else if (value_int64)
-		*value_int64 = 0;
+	assert(value_str);
+	assert(value_str_size > 0);
+
+	/* Set default value */
+	*value_str = '\0';
 
 	while (*buf)
 	{
@@ -1510,7 +1398,7 @@ get_control_value(const char *str, const char *name,
 				if (*buf == '"')
 					state = CONTROL_INNAME;
 				else if (IsAlpha(*buf))
-					goto bad_format;
+					control_string_bad_format(str);
 				break;
 			case CONTROL_INNAME:
 				/* Found target field. Parse value. */
@@ -1529,57 +1417,32 @@ get_control_value(const char *str, const char *name,
 				if (*buf == ':')
 					state = CONTROL_WAIT_VALUE;
 				else if (!IsSpace(*buf))
-					goto bad_format;
+					control_string_bad_format(str);
 				break;
 			case CONTROL_WAIT_VALUE:
 				if (*buf == '"')
 				{
 					state = CONTROL_INVALUE;
-					buf_int64_ptr = buf_int64;
 				}
 				else if (IsAlpha(*buf))
-					goto bad_format;
+					control_string_bad_format(str);
 				break;
 			case CONTROL_INVALUE:
 				/* Value was parsed, exit */
 				if (*buf == '"')
 				{
-					if (value_str)
-					{
-						*value_str = '\0';
-					}
-					else if (value_int64)
-					{
-						/* Length of buf_uint64 should not be greater than 31 */
-						if (buf_int64_ptr - buf_int64 >= 32)
-							elog(ERROR, "field \"%s\" is out of range in the line %s of the file %s",
-								 name, str, DATABASE_FILE_LIST);
-
-						*buf_int64_ptr = '\0';
-						if (!parse_int64(buf_int64, value_int64, 0))
-						{
-							/* We assume that too big value is -1 */
-							if (errno == ERANGE)
-								*value_int64 = BYTES_INVALID;
-							else
-								goto bad_format;
-						}
-					}
-
+					*value_str = '\0';
 					return true;
 				}
 				else
 				{
-					if (value_str)
-					{
-						*value_str = *buf;
-						value_str++;
+					/* verify if value_str not exceeds value_str_size limits */
+					if (value_str - value_str_start >= value_str_size - 1) {
+						elog(ERROR, "field \"%s\" is out of range in the line %s of the file %s",
+							 name, str, DATABASE_FILE_LIST);
 					}
-					else
-					{
-						*buf_int64_ptr = *buf;
-						buf_int64_ptr++;
-					}
+					*value_str = *buf;
+					value_str++;
 				}
 				break;
 			case CONTROL_WAIT_NEXT_NAME:
@@ -1596,18 +1459,20 @@ get_control_value(const char *str, const char *name,
 
 	/* There is no close quotes */
 	if (state == CONTROL_INNAME || state == CONTROL_INVALUE)
-		goto bad_format;
+		control_string_bad_format(str);
 
 	/* Did not find target field */
 	if (is_mandatory)
 		elog(ERROR, "field \"%s\" is not found in the line %s of the file %s",
 			 name, str, DATABASE_FILE_LIST);
 	return false;
+}
 
-bad_format:
-	elog(ERROR, "%s file has invalid format in line %s",
-		 DATABASE_FILE_LIST, str);
-	return false;	/* Make compiler happy */
+static void
+control_string_bad_format(const char* str)
+{
+    elog(ERROR, "%s file has invalid format in line %s",
+         DATABASE_FILE_LIST, str);
 }
 
 /*
@@ -1802,7 +1667,7 @@ write_database_map(pgBackup *backup, parray *database_map, parray *backup_files_
 								 FIO_BACKUP_HOST);
 	file->crc = pgFileGetCRC(database_map_path, true, false);
 	file->write_size = file->size;
-	file->uncompressed_size = file->read_size;
+	file->uncompressed_size = file->size;
 
 	parray_append(backup_files_list, file);
 }
@@ -1841,8 +1706,8 @@ read_database_map(pgBackup *backup)
 
 		db_map_entry *db_entry = (db_map_entry *) pgut_malloc(sizeof(db_map_entry));
 
-		get_control_value(buf, "dbOid", NULL, &dbOid, true);
-		get_control_value(buf, "datname", datname, NULL, true);
+        get_control_value_int64(buf, "dbOid", &dbOid, true);
+        get_control_value_str(buf, "datname", datname, sizeof(datname), true);
 
 		db_entry->dbOid = dbOid;
 		db_entry->datname = pgut_strdup(datname);
@@ -1889,7 +1754,7 @@ cleanup_tablespace(const char *path)
 		join_path_components(fullpath, path, file->rel_path);
 
 		fio_delete(file->mode, fullpath, FIO_DB_HOST);
-		elog(VERBOSE, "Deleted file \"%s\"", fullpath);
+		elog(LOG, "Deleted file \"%s\"", fullpath);
 	}
 
 	parray_walk(files, pgFileFree);
@@ -1908,4 +1773,87 @@ pfilearray_clear_locks(parray *file_list)
 		pgFile *file = (pgFile *) parray_get(file_list, i);
 		pg_atomic_clear_flag(&file->lock);
 	}
+}
+
+static inline bool
+is_forkname(char *name, size_t *pos, const char *forkname)
+{
+	size_t fnlen = strlen(forkname);
+	if (strncmp(name + *pos, forkname, fnlen) != 0)
+		return false;
+	*pos += fnlen;
+	return true;
+}
+
+#define OIDCHARS 10
+#define MAXSEGNO (((uint64_t)1<<32)/RELSEG_SIZE-1)
+#define SEGNOCHARS 5 /* when BLCKSZ == (1<<15) */
+
+/* Set forkName if possible */
+bool
+set_forkname(pgFile *file)
+{
+	size_t i = 0;
+	uint64_t oid = 0; /* use 64bit to not check for overflow in a loop */
+	uint64_t segno = 0;
+
+	/* pretend it is not relation file */
+	file->relOid = 0;
+	file->forkName = none;
+	file->is_datafile = false;
+
+	for (i = 0; isdigit(file->name[i]); i++)
+	{
+		if (i == 0 && file->name[i] == '0')
+			return false;
+		oid = oid * 10 + file->name[i] - '0';
+	}
+	if (i == 0 || i > OIDCHARS || oid > UINT32_MAX)
+		return false;
+
+	/* usual fork name */
+	/* /^\d+_(vm|fsm|init|ptrack)$/ */
+	if (is_forkname(file->name, &i, "_vm"))
+		file->forkName = vm;
+	else if (is_forkname(file->name, &i, "_fsm"))
+		file->forkName = fsm;
+	else if (is_forkname(file->name, &i, "_init"))
+		file->forkName = init;
+	else if (is_forkname(file->name, &i, "_ptrack"))
+		file->forkName = ptrack;
+
+	/* segment number */
+	/* /^\d+(_(vm|fsm|init|ptrack))?\.\d+$/ */
+	if (file->name[i] == '.' && isdigit(file->name[i+1]))
+	{
+		size_t start = i+1;
+		for (i++; isdigit(file->name[i]); i++)
+		{
+			if (i == start && file->name[i] == '0')
+				return false;
+			segno = segno * 10 + file->name[i] - '0';
+		}
+		if (i - start > SEGNOCHARS || segno > MAXSEGNO)
+			return false;
+	}
+
+	/* CFS "fork name" */
+	if (file->forkName == none &&
+		is_forkname(file->name, &i, ".cfm"))
+	{
+		/* /^\d+(\.\d+)?.cfm$/ */
+		file->forkName = cfm;
+	}
+
+	/* If there are excess characters, it is not relation file */
+	if (file->name[i] != 0)
+	{
+		file->forkName = none;
+		return false;
+	}
+
+	file->relOid = oid;
+	file->segno = segno;
+	file->is_datafile = file->forkName == none;
+	return true;
 }

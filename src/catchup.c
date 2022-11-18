@@ -2,7 +2,7 @@
  *
  * catchup.c: sync DB cluster
  *
- * Copyright (c) 2021, Postgres Professional
+ * Copyright (c) 2021-2022, Postgres Professional
  *
  *-------------------------------------------------------------------------
  */
@@ -203,7 +203,7 @@ catchup_preflight_checks(PGNodeInfo *source_node_info, PGconn *source_conn,
 
 		/* fill dest_redo.lsn and dest_redo.tli */
 		get_redo(dest_pgdata, FIO_LOCAL_HOST, &dest_redo);
-		elog(VERBOSE, "source.tli = %X, dest_redo.lsn = %X/%X, dest_redo.tli = %X",
+		elog(LOG, "source.tli = %X, dest_redo.lsn = %X/%X, dest_redo.tli = %X",
 			current.tli, (uint32) (dest_redo.lsn >> 32), (uint32) dest_redo.lsn, dest_redo.tli);
 
 		if (current.tli != 1)
@@ -398,9 +398,8 @@ catchup_thread_runner(void *arg)
 		if (interrupted || thread_interrupted)
 			elog(ERROR, "Interrupted during catchup");
 
-		if (progress)
-			elog(INFO, "Progress: (%d/%d). Process file \"%s\"",
-				 i + 1, n_files, file->rel_path);
+		elog(progress ? INFO : LOG, "Progress: (%d/%d). Process file \"%s\"",
+			 i + 1, n_files, file->rel_path);
 
 		/* construct destination filepath */
 		Assert(file->external_dir_num == 0);
@@ -447,12 +446,12 @@ catchup_thread_runner(void *arg)
 
 		if (file->write_size == BYTES_INVALID)
 		{
-			elog(VERBOSE, "Skipping the unchanged file: \"%s\", read %li bytes", from_fullpath, file->read_size);
+			elog(LOG, "Skipping the unchanged file: \"%s\", read %li bytes", from_fullpath, file->read_size);
 			continue;
 		}
 
 		arguments->transfered_bytes += file->write_size;
-		elog(VERBOSE, "File \"%s\". Copied "INT64_FORMAT " bytes",
+		elog(LOG, "File \"%s\". Copied "INT64_FORMAT " bytes",
 						from_fullpath, file->write_size);
 	}
 
@@ -507,16 +506,20 @@ catchup_multithreaded_copy(int num_threads,
 	/* Run threads */
 	thread_interrupted = false;
 	threads = (pthread_t *) palloc(sizeof(pthread_t) * num_threads);
-	for (i = 0; i < num_threads; i++)
+	if (!dry_run)
 	{
-		elog(VERBOSE, "Start thread num: %i", i);
-		pthread_create(&threads[i], NULL, &catchup_thread_runner, &(threads_args[i]));
+		for (i = 0; i < num_threads; i++)
+		{
+			elog(VERBOSE, "Start thread num: %i", i);
+			pthread_create(&threads[i], NULL, &catchup_thread_runner, &(threads_args[i]));
+		}
 	}
 
 	/* Wait threads */
 	for (i = 0; i < num_threads; i++)
 	{
-		pthread_join(threads[i], NULL);
+		if (!dry_run)
+			pthread_join(threads[i], NULL);
 		all_threads_successful &= threads_args[i].completed;
 		transfered_bytes_result += threads_args[i].transfered_bytes;
 	}
@@ -603,7 +606,7 @@ filter_filelist(parray *filelist, const char *pgdata,
 			&& parray_bsearch(exclude_relative_paths_list, file->rel_path, pgPrefixCompareString)!= NULL)
 			)
 		{
-			elog(LOG, "%s file \"%s\" excluded with --exclude-path option", logging_string, full_path);
+			elog(INFO, "%s file \"%s\" excluded with --exclude-path option", logging_string, full_path);
 			file->excluded = true;
 		}
 	}
@@ -646,7 +649,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 	if (exclude_relative_paths_list != NULL)
 		parray_qsort(exclude_relative_paths_list, pgCompareString);
 
-	elog(LOG, "Database catchup start");
+	elog(INFO, "Database catchup start");
 
 	if (current.backup_mode != BACKUP_MODE_FULL)
 	{
@@ -693,7 +696,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 
 		/* Call pg_start_backup function in PostgreSQL connect */
 		pg_start_backup(label, smooth_checkpoint, &current, &source_node_info, source_conn);
-		elog(LOG, "pg_start_backup START LSN %X/%X", (uint32) (current.start_lsn >> 32), (uint32) (current.start_lsn));
+		elog(INFO, "pg_start_backup START LSN %X/%X", (uint32) (current.start_lsn >> 32), (uint32) (current.start_lsn));
 	}
 
 	/* Sanity: source cluster must be "in future" relatively to dest cluster */
@@ -706,9 +709,14 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 
 	/* Start stream replication */
 	join_path_components(dest_xlog_path, dest_pgdata, PG_XLOG_DIR);
-	fio_mkdir(dest_xlog_path, DIR_PERMISSION, FIO_LOCAL_HOST);
-	start_WAL_streaming(source_conn, dest_xlog_path, &instance_config.conn_opt,
-						current.start_lsn, current.tli, false);
+	if (!dry_run)
+	{
+		fio_mkdir(dest_xlog_path, DIR_PERMISSION, FIO_LOCAL_HOST);
+		start_WAL_streaming(source_conn, dest_xlog_path, &instance_config.conn_opt,
+										current.start_lsn, current.tli, false);
+	}
+	else
+		elog(INFO, "WAL streaming skipping with --dry-run option");
 
 	source_filelist = parray_new();
 
@@ -763,11 +771,11 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 		elog(INFO, "Source PGDATA size: %s (excluded %s)", pretty_source_bytes, pretty_bytes);
 	}
 
-	elog(LOG, "Start LSN (source): %X/%X, TLI: %X",
+	elog(INFO, "Start LSN (source): %X/%X, TLI: %X",
 			(uint32) (current.start_lsn >> 32), (uint32) (current.start_lsn),
 			current.tli);
 	if (current.backup_mode != BACKUP_MODE_FULL)
-		elog(LOG, "LSN in destination: %X/%X, TLI: %X",
+		elog(INFO, "LSN in destination: %X/%X, TLI: %X",
 			 (uint32) (dest_redo.lsn >> 32), (uint32) (dest_redo.lsn),
 			 dest_redo.tli);
 
@@ -779,9 +787,9 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 
 		/* Build the page map from ptrack information */
 		make_pagemap_from_ptrack_2(source_filelist, source_conn,
-								   source_node_info.ptrack_schema,
-								   source_node_info.ptrack_version_num,
-								   dest_redo.lsn);
+									source_node_info.ptrack_schema,
+									source_node_info.ptrack_version_num,
+									dest_redo.lsn);
 		time(&end_time);
 		elog(INFO, "Pagemap successfully extracted, time elapsed: %.0f sec",
 			 difftime(end_time, start_time));
@@ -821,8 +829,9 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 
 			join_path_components(dirpath, dest_pgdata, file->rel_path);
 
-			elog(VERBOSE, "Create directory '%s'", dirpath);
-			fio_mkdir(dirpath, DIR_PERMISSION, FIO_LOCAL_HOST);
+			elog(LOG, "Create directory '%s'", dirpath);
+			if (!dry_run)
+				fio_mkdir(dirpath, DIR_PERMISSION, FIO_LOCAL_HOST);
 		}
 		else
 		{
@@ -850,18 +859,21 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 
 			join_path_components(to_path, dest_pgdata, file->rel_path);
 
-			elog(VERBOSE, "Create directory \"%s\" and symbolic link \"%s\"",
+			elog(INFO, "Create directory \"%s\" and symbolic link \"%s\"",
 					 linked_path, to_path);
 
-			/* create tablespace directory */
-			if (fio_mkdir(linked_path, file->mode, FIO_LOCAL_HOST) != 0)
-				elog(ERROR, "Could not create tablespace directory \"%s\": %s",
-					 linked_path, strerror(errno));
+			if (!dry_run)
+			{
+				/* create tablespace directory */
+				if (fio_mkdir(linked_path, file->mode, FIO_LOCAL_HOST) != 0)
+					elog(ERROR, "Could not create tablespace directory \"%s\": %s",
+						 linked_path, strerror(errno));
 
-			/* create link to linked_path */
-			if (fio_symlink(linked_path, to_path, true, FIO_LOCAL_HOST) < 0)
-				elog(ERROR, "Could not create symbolic link \"%s\" -> \"%s\": %s",
-					 linked_path, to_path, strerror(errno));
+				/* create link to linked_path */
+				if (fio_symlink(linked_path, to_path, true, FIO_LOCAL_HOST) < 0)
+					elog(ERROR, "Could not create symbolic link \"%s\" -> \"%s\": %s",
+						 linked_path, to_path, strerror(errno));
+			}
 		}
 	}
 
@@ -930,8 +942,11 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 				char		fullpath[MAXPGPATH];
 
 				join_path_components(fullpath, dest_pgdata, file->rel_path);
-				fio_delete(file->mode, fullpath, FIO_LOCAL_HOST);
-				elog(VERBOSE, "Deleted file \"%s\"", fullpath);
+				if (!dry_run)
+				{
+					fio_delete(file->mode, fullpath, FIO_LOCAL_HOST);
+				}
+				elog(LOG, "Deleted file \"%s\"", fullpath);
 
 				/* shrink dest pgdata list */
 				pgFileFree(file);
@@ -961,7 +976,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 	catchup_isok = transfered_datafiles_bytes != -1;
 
 	/* at last copy control file */
-	if (catchup_isok)
+	if (catchup_isok && !dry_run)
 	{
 		char	from_fullpath[MAXPGPATH];
 		char	to_fullpath[MAXPGPATH];
@@ -972,7 +987,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 		transfered_datafiles_bytes += source_pg_control_file->size;
 	}
 
-	if (!catchup_isok)
+	if (!catchup_isok && !dry_run)
 	{
 		char	pretty_time[20];
 		char	pretty_transfered_data_bytes[20];
@@ -1010,14 +1025,18 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 		pg_free(stop_backup_query_text);
 	}
 
-	wait_wal_and_calculate_stop_lsn(dest_xlog_path, stop_backup_result.lsn, &current);
+	if (!dry_run)
+		wait_wal_and_calculate_stop_lsn(dest_xlog_path, stop_backup_result.lsn, &current);
 
 #if PG_VERSION_NUM >= 90600
 	/* Write backup_label */
 	Assert(stop_backup_result.backup_label_content != NULL);
-	pg_stop_backup_write_file_helper(dest_pgdata, PG_BACKUP_LABEL_FILE, "backup label",
-		stop_backup_result.backup_label_content, stop_backup_result.backup_label_content_len,
-		NULL);
+	if (!dry_run)
+	{
+		pg_stop_backup_write_file_helper(dest_pgdata, PG_BACKUP_LABEL_FILE, "backup label",
+			stop_backup_result.backup_label_content, stop_backup_result.backup_label_content_len,
+			NULL);
+	}
 	free(stop_backup_result.backup_label_content);
 	stop_backup_result.backup_label_content = NULL;
 	stop_backup_result.backup_label_content_len = 0;
@@ -1040,6 +1059,7 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 #endif
 
 	/* wait for end of wal streaming and calculate wal size transfered */
+	if (!dry_run)
 	{
 		parray *wal_files_list = NULL;
 		wal_files_list = parray_new();
@@ -1091,17 +1111,17 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 	}
 
 	/* Sync all copied files unless '--no-sync' flag is used */
-	if (sync_dest_files)
+	if (sync_dest_files && !dry_run)
 		catchup_sync_destination_files(dest_pgdata, FIO_LOCAL_HOST, source_filelist, source_pg_control_file);
 	else
 		elog(WARNING, "Files are not synced to disk");
 
 	/* Cleanup */
-	if (dest_filelist)
+	if (dest_filelist && !dry_run)
 	{
 		parray_walk(dest_filelist, pgFileFree);
-		parray_free(dest_filelist);
 	}
+	parray_free(dest_filelist);
 	parray_walk(source_filelist, pgFileFree);
 	parray_free(source_filelist);
 	pgFileFree(source_pg_control_file);

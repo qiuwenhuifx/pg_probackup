@@ -23,7 +23,7 @@ static pgBackup* get_closest_backup(timelineInfo *tlinfo);
 static pgBackup* get_oldest_backup(timelineInfo *tlinfo);
 static const char *backupModes[] = {"", "PAGE", "PTRACK", "DELTA", "FULL"};
 static pgBackup *readBackupControlFile(const char *path);
-static time_t create_backup_dir(pgBackup *backup, const char *backup_instance_path);
+static int create_backup_dir(pgBackup *backup, const char *backup_instance_path);
 
 static bool backup_lock_exit_hook_registered = false;
 static parray *locks = NULL;
@@ -969,6 +969,7 @@ catalog_get_backup_list(InstanceState *instanceState, time_t requested_backup_id
 		}
 		else if (strcmp(base36enc(backup->start_time), data_ent->d_name) != 0)
 		{
+			/* TODO there is no such guarantees */
 			elog(WARNING, "backup ID in control file \"%s\" doesn't match name of the backup folder \"%s\"",
 				 base36enc(backup->start_time), backup_conf_path);
 		}
@@ -1068,6 +1069,7 @@ get_backup_filelist(pgBackup *backup, bool strict)
 		char		linked[MAXPGPATH];
 		char		compress_alg_string[MAXPGPATH];
 		int64		write_size,
+					uncompressed_size,
 					mode,		/* bit length of mode_t depends on platforms */
 					is_datafile,
 					is_cfs,
@@ -1084,15 +1086,15 @@ get_backup_filelist(pgBackup *backup, bool strict)
 
 		COMP_FILE_CRC32(true, content_crc, buf, strlen(buf));
 
-		get_control_value(buf, "path", path, NULL, true);
-		get_control_value(buf, "size", NULL, &write_size, true);
-		get_control_value(buf, "mode", NULL, &mode, true);
-		get_control_value(buf, "is_datafile", NULL, &is_datafile, true);
-		get_control_value(buf, "is_cfs", NULL, &is_cfs, false);
-		get_control_value(buf, "crc", NULL, &crc, true);
-		get_control_value(buf, "compress_alg", compress_alg_string, NULL, false);
-		get_control_value(buf, "external_dir_num", NULL, &external_dir_num, false);
-		get_control_value(buf, "dbOid", NULL, &dbOid, false);
+        get_control_value_str(buf, "path", path, sizeof(path),true);
+        get_control_value_int64(buf, "size", &write_size, true);
+        get_control_value_int64(buf, "mode", &mode, true);
+        get_control_value_int64(buf, "is_datafile", &is_datafile, true);
+        get_control_value_int64(buf, "is_cfs", &is_cfs, false);
+        get_control_value_int64(buf, "crc", &crc, true);
+        get_control_value_str(buf, "compress_alg", compress_alg_string, sizeof(compress_alg_string), false);
+        get_control_value_int64(buf, "external_dir_num", &external_dir_num, false);
+        get_control_value_int64(buf, "dbOid", &dbOid, false);
 
 		file = pgFileInit(path);
 		file->write_size = (int64) write_size;
@@ -1107,29 +1109,54 @@ get_backup_filelist(pgBackup *backup, bool strict)
 		/*
 		 * Optional fields
 		 */
-		if (get_control_value(buf, "linked", linked, NULL, false) && linked[0])
+		if (get_control_value_str(buf, "linked", linked, sizeof(linked), false) && linked[0])
 		{
 			file->linked = pgut_strdup(linked);
 			canonicalize_path(file->linked);
 		}
 
-		if (get_control_value(buf, "segno", NULL, &segno, false))
+		if (get_control_value_int64(buf, "segno", &segno, false))
 			file->segno = (int) segno;
 
-		if (get_control_value(buf, "n_blocks", NULL, &n_blocks, false))
+		if (get_control_value_int64(buf, "n_blocks", &n_blocks, false))
 			file->n_blocks = (int) n_blocks;
 
-		if (get_control_value(buf, "n_headers", NULL, &n_headers, false))
+		if (get_control_value_int64(buf, "n_headers", &n_headers, false))
 			file->n_headers = (int) n_headers;
 
-		if (get_control_value(buf, "hdr_crc", NULL, &hdr_crc, false))
+		if (get_control_value_int64(buf, "hdr_crc", &hdr_crc, false))
 			file->hdr_crc = (pg_crc32) hdr_crc;
 
-		if (get_control_value(buf, "hdr_off", NULL, &hdr_off, false))
+		if (get_control_value_int64(buf, "hdr_off", &hdr_off, false))
 			file->hdr_off = hdr_off;
 
-		if (get_control_value(buf, "hdr_size", NULL, &hdr_size, false))
+		if (get_control_value_int64(buf, "hdr_size", &hdr_size, false))
 			file->hdr_size = (int) hdr_size;
+
+		if (get_control_value_int64(buf, "full_size", &uncompressed_size, false))
+			file->uncompressed_size = uncompressed_size;
+		else
+			file->uncompressed_size = write_size;
+		if (!file->is_datafile || file->is_cfs)
+			file->size = file->uncompressed_size;
+
+		if (file->external_dir_num == 0 && S_ISREG(file->mode))
+		{
+			bool is_datafile = file->is_datafile;
+			set_forkname(file);
+			if (is_datafile != file->is_datafile)
+			{
+				if (is_datafile)
+					elog(WARNING, "File '%s' was stored as datafile, but looks like it is not",
+						 file->rel_path);
+				else
+					elog(WARNING, "File '%s' was stored as non-datafile, but looks like it is",
+						 file->rel_path);
+				/* Lets fail in tests */
+				Assert(file->is_datafile == file->is_datafile);
+				file->is_datafile = is_datafile;
+			}
+		}
 
 		parray_append(files, file);
 	}
@@ -1411,20 +1438,34 @@ get_multi_timeline_parent(parray *backup_list, parray *tli_list,
 	return NULL;
 }
 
-/* Create backup directory in $BACKUP_PATH
- * Note, that backup_id attribute is updated,
- * so it is possible to get diffrent values in
+/*
+ * Create backup directory in $BACKUP_PATH
+ * (with proposed backup->backup_id)
+ * and initialize this directory.
+ * If creation of directory fails, then
+ * backup_id will be cleared (set to INVALID_BACKUP_ID).
+ * It is possible to get diffrent values in
  * pgBackup.start_time and pgBackup.backup_id.
  * It may be ok or maybe not, so it's up to the caller
  * to fix it or let it be.
  */
 
 void
-pgBackupCreateDir(pgBackup *backup, const char *backup_instance_path)
+pgBackupInitDir(pgBackup *backup, const char *backup_instance_path)
 {
-	int		i;
-	parray *subdirs = parray_new();
+	int	i;
+	char	temp[MAXPGPATH];
+	parray *subdirs;
 
+	/* Try to create backup directory at first */
+	if (create_backup_dir(backup, backup_instance_path) != 0)
+	{
+		/* Clear backup_id as indication of error */
+		backup->backup_id = INVALID_BACKUP_ID;
+		return;
+	}
+
+	subdirs = parray_new();
 	parray_append(subdirs, pg_strdup(DATABASE_DIR));
 
 	/* Add external dirs containers */
@@ -1436,18 +1477,12 @@ pgBackupCreateDir(pgBackup *backup, const char *backup_instance_path)
 													 false);
 		for (i = 0; i < parray_num(external_list); i++)
 		{
-			char		temp[MAXPGPATH];
 			/* Numeration of externaldirs starts with 1 */
 			makeExternalDirPathByNum(temp, EXTERNAL_DIR, i+1);
 			parray_append(subdirs, pg_strdup(temp));
 		}
 		free_dir_list(external_list);
 	}
-
-	backup->backup_id = create_backup_dir(backup, backup_instance_path);
-
-	if (backup->backup_id == 0)
-		elog(ERROR, "Cannot create backup directory: %s", strerror(errno));
 
 	backup->database_dir = pgut_malloc(MAXPGPATH);
 	join_path_components(backup->database_dir, backup->root_dir, DATABASE_DIR);
@@ -1458,10 +1493,8 @@ pgBackupCreateDir(pgBackup *backup, const char *backup_instance_path)
 	/* create directories for actual backup files */
 	for (i = 0; i < parray_num(subdirs); i++)
 	{
-		char	path[MAXPGPATH];
-
-		join_path_components(path, backup->root_dir, parray_get(subdirs, i));
-		fio_mkdir(path, DIR_PERMISSION, FIO_BACKUP_HOST);
+		join_path_components(temp, backup->root_dir, parray_get(subdirs, i));
+		fio_mkdir(temp, DIR_PERMISSION, FIO_BACKUP_HOST);
 	}
 
 	free_dir_list(subdirs);
@@ -1470,36 +1503,26 @@ pgBackupCreateDir(pgBackup *backup, const char *backup_instance_path)
 /*
  * Create root directory for backup,
  * update pgBackup.root_dir if directory creation was a success
+ * Return values (same as dir_create_dir()):
+ *  0 - ok
+ * -1 - error (warning message already emitted)
  */
-time_t
+int
 create_backup_dir(pgBackup *backup, const char *backup_instance_path)
 {
-	int     attempts = 10;
+	int    rc;
+	char   path[MAXPGPATH];
 
-	while (attempts--)
-	{
-		int    rc;
-		char   path[MAXPGPATH];
-		time_t backup_id = time(NULL);
+	join_path_components(path, backup_instance_path, base36enc(backup->backup_id));
 
-		join_path_components(path, backup_instance_path, base36enc(backup_id));
+	/* TODO: add wrapper for remote mode */
+	rc = dir_create_dir(path, DIR_PERMISSION, true);
 
-		/* TODO: add wrapper for remote mode */
-		rc = dir_create_dir(path, DIR_PERMISSION, true);
-
-		if (rc == 0)
-		{
-			backup->root_dir = pgut_strdup(path);
-			return backup_id;
-		}
-		else
-		{
-			elog(WARNING, "Cannot create directory \"%s\": %s", path, strerror(errno));
-			sleep(1);
-		}
-	}
-
-	return 0;
+	if (rc == 0)
+		backup->root_dir = pgut_strdup(path);
+	else
+		elog(WARNING, "Cannot create directory \"%s\": %s", path, strerror(errno));
+	return rc;
 }
 
 /*
@@ -2491,7 +2514,7 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 	char		control_path[MAXPGPATH];
 	char		control_path_temp[MAXPGPATH];
 	size_t		i = 0;
-	#define BUFFERSZ 1024*1024
+	#define BUFFERSZ (1024*1024)
 	char		*buf;
 	int64 		backup_size_on_disk = 0;
 	int64 		uncompressed_size_on_disk = 0;
@@ -2560,6 +2583,11 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 					deparse_compress_alg(file->compress_alg),
 					file->external_dir_num,
 					file->dbOid);
+
+		if (file->uncompressed_size != 0 &&
+				file->uncompressed_size != file->write_size)
+			len += sprintf(line+len, ",\"full_size\":\"" INT64_FORMAT "\"",
+						   file->uncompressed_size);
 
 		if (file->is_datafile)
 			len += sprintf(line+len, ",\"segno\":\"%d\"", file->segno);
