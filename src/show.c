@@ -353,7 +353,7 @@ print_backup_json_object(PQExpBuffer buf, pgBackup *backup)
 
 	json_add(buf, JT_BEGIN_OBJECT, &json_level);
 
-	json_add_value(buf, "id", base36enc(backup->start_time), json_level,
+	json_add_value(buf, "id", backup_id_of(backup), json_level,
 					true);
 
 	if (backup->parent_backup != 0)
@@ -452,7 +452,7 @@ print_backup_json_object(PQExpBuffer buf, pgBackup *backup)
 		appendPQExpBuffer(buf, INT64_FORMAT, backup->uncompressed_bytes);
 	}
 
-	if (backup->uncompressed_bytes >= 0)
+	if (backup->pgdata_bytes >= 0)
 	{
 		json_add_key(buf, "pgdata-bytes", json_level);
 		appendPQExpBuffer(buf, INT64_FORMAT, backup->pgdata_bytes);
@@ -514,6 +514,8 @@ show_backup(InstanceState *instanceState, time_t requested_backup_id)
 		elog(INFO, "Requested backup \"%s\" is not found.",
 			 /* We do not need free base36enc's result, we exit anyway */
 			 base36enc(requested_backup_id));
+		parray_walk(backups, pgBackupFree);
+		parray_free(backups);
 		/* This is not error */
 		return 0;
 	}
@@ -583,7 +585,7 @@ show_instance_plain(const char *instance_name, parray *backup_list, bool show_na
 
 		/* ID */
 		snprintf(row->backup_id, lengthof(row->backup_id), "%s",
-				 base36enc(backup->start_time));
+				 backup_id_of(backup));
 		widths[cur] = Max(widths[cur], strlen(row->backup_id));
 		cur++;
 
@@ -1100,7 +1102,7 @@ show_archive_json(const char *instance_name, uint32 xlog_seg_size,
 
 		if (tlinfo->closest_backup != NULL)
 			snprintf(tmp_buf, lengthof(tmp_buf), "%s",
-						base36enc(tlinfo->closest_backup->start_time));
+						backup_id_of(tlinfo->closest_backup));
 		else
 			snprintf(tmp_buf, lengthof(tmp_buf), "%s", "");
 

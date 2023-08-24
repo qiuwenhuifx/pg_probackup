@@ -1,7 +1,9 @@
 # you need os for unittest to work
 import os
 import gc
+import unittest
 from sys import exit, argv, version_info
+import signal
 import subprocess
 import shutil
 import six
@@ -13,6 +15,7 @@ import select
 from time import sleep
 import re
 import json
+import random
 
 idx_ptrack = {
     't_heap': {
@@ -87,27 +90,34 @@ def dir_files(base_dir):
     return out_list
 
 
+def is_pgpro():
+    # pg_config --help
+    cmd = [os.environ['PG_CONFIG'], '--help']
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    return b'postgrespro' in result.stdout
+
+
 def is_enterprise():
     # pg_config --help
     cmd = [os.environ['PG_CONFIG'], '--help']
 
-    p = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    return b'postgrespro.ru' in p.communicate()[0]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    # PostgresPro std or ent
+    if b'postgrespro' in p.stdout:
+        cmd = [os.environ['PG_CONFIG'], '--pgpro-edition']
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
- 
+        return b'enterprise' in p.stdout
+    else: # PostgreSQL
+        return False
+
+
 def is_nls_enabled():
     cmd = [os.environ['PG_CONFIG'], '--configure']
 
-    p = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    return b'enable-nls' in p.communicate()[0]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    return b'enable-nls' in result.stdout
 
 
 def base36enc(number):
@@ -138,47 +148,105 @@ class ProbackupException(Exception):
     def __str__(self):
         return '\n ERROR: {0}\n CMD: {1}'.format(repr(self.message), self.cmd)
 
+class PostgresNodeExtended(testgres.PostgresNode):
 
-def slow_start(self, replica=False):
+    def __init__(self, base_dir=None, *args, **kwargs):
+        super(PostgresNodeExtended, self).__init__(name='test', base_dir=base_dir, *args, **kwargs)
+        self.is_started = False
 
-    # wait for https://github.com/postgrespro/testgres/pull/50
-#    self.start()
-#    self.poll_query_until(
-#       "postgres",
-#       "SELECT not pg_is_in_recovery()",
-#       suppress={testgres.NodeConnection})
-    if replica:
-        query = 'SELECT pg_is_in_recovery()'
-    else:
-        query = 'SELECT not pg_is_in_recovery()'
+    def slow_start(self, replica=False):
 
-    self.start()
-    while True:
-        try:
-            output = self.safe_psql('template1', query).decode("utf-8").rstrip()
+        # wait for https://github.com/postgrespro/testgres/pull/50
+        #    self.start()
+        #    self.poll_query_until(
+        #       "postgres",
+        #       "SELECT not pg_is_in_recovery()",
+        #       suppress={testgres.NodeConnection})
+        if replica:
+            query = 'SELECT pg_is_in_recovery()'
+        else:
+            query = 'SELECT not pg_is_in_recovery()'
 
-            if output == 't':
-                break
+        self.start()
+        while True:
+            try:
+                output = self.safe_psql('template1', query).decode("utf-8").rstrip()
 
-        except testgres.QueryException as e:
-            if 'database system is starting up' in e.message:
-                pass
-            elif 'FATAL:  the database system is not accepting connections' in e.message:
-                pass
-            elif replica and 'Hot standby mode is disabled' in e.message:
-                raise e
+                if output == 't':
+                    break
+
+            except testgres.QueryException as e:
+                if 'database system is starting up' in e.message:
+                    pass
+                elif 'FATAL:  the database system is not accepting connections' in e.message:
+                    pass
+                elif replica and 'Hot standby mode is disabled' in e.message:
+                    raise e
+                else:
+                    raise e
+
+            sleep(0.5)
+
+    def start(self, *args, **kwargs):
+        if not self.is_started:
+            super(PostgresNodeExtended, self).start(*args, **kwargs)
+            self.is_started = True
+        return self
+
+    def stop(self, *args, **kwargs):
+        if self.is_started:
+            result = super(PostgresNodeExtended, self).stop(*args, **kwargs)
+            self.is_started = False
+            return result
+
+    def kill(self, someone = None):
+        if self.is_started:
+            sig = signal.SIGKILL if os.name != 'nt' else signal.SIGBREAK
+            if someone == None:
+                os.kill(self.pid, sig)
             else:
-                raise e
+                os.kill(self.auxiliary_pids[someone][0], sig)
+            self.is_started = False
 
-        sleep(0.5)
+    def table_checksum(self, table, dbname="postgres"):
+        con = self.connect(dbname=dbname)
+
+        curname = "cur_"+str(random.randint(0,2**48))
+
+        con.execute("""
+            DECLARE %s NO SCROLL CURSOR FOR
+            SELECT t::text FROM %s as t
+        """ % (curname, table))
+
+        sum = hashlib.md5()
+        while True:
+            rows = con.execute("FETCH FORWARD 5000 FROM %s" % curname)
+            if not rows:
+                break
+            for row in rows:
+                # hash uses SipHash since Python3.4, therefore it is good enough
+                sum.update(row[0].encode('utf8'))
+
+        con.execute("CLOSE %s; ROLLBACK;" % curname)
+
+        con.close()
+        return sum.hexdigest()
 
 class ProbackupTest(object):
     # Class attributes
     enterprise = is_enterprise()
     enable_nls = is_nls_enabled()
+    pgpro = is_pgpro()
 
     def __init__(self, *args, **kwargs):
         super(ProbackupTest, self).__init__(*args, **kwargs)
+
+        self.nodes_to_cleanup = []
+
+        if isinstance(self, unittest.TestCase):
+            self.module_name = self.id().split('.')[1]
+            self.fname = self.id().split('.')[3]
+
         if '-v' in argv or '--verbose' in argv:
             self.verbose = True
         else:
@@ -339,6 +407,45 @@ class ProbackupTest(object):
 
         os.environ["PGAPPNAME"] = "pg_probackup"
 
+    def is_test_result_ok(test_case):
+        # sources of solution:
+        # 1. python versions 2.7 - 3.10, verified on 3.10, 3.7, 2.7, taken from:
+        # https://tousu.in/qa/?qa=555402/unit-testing-getting-pythons-unittest-results-in-a-teardown-method&show=555403#a555403
+        #
+        # 2. python versions 3.11+ mixin, verified on 3.11, taken from: https://stackoverflow.com/a/39606065
+
+        if not isinstance(test_case, unittest.TestCase):
+            raise AssertionError("test_case is not instance of unittest.TestCase")
+
+        if hasattr(test_case, '_outcome'):  # Python 3.4+
+            if hasattr(test_case._outcome, 'errors'):
+                # Python 3.4 - 3.10  (These two methods have no side effects)
+                result = test_case.defaultTestResult()  # These two methods have no side effects
+                test_case._feedErrorsToResult(result, test_case._outcome.errors)
+            else:
+                # Python 3.11+
+                result = test_case._outcome.result
+        else:  # Python 2.7, 3.0-3.3
+            result = getattr(test_case, '_outcomeForDoCleanups', test_case._resultForDoCleanups)
+
+        ok = all(test != test_case for test, text in result.errors + result.failures)
+
+        return ok
+
+    def tearDown(self):
+        if self.is_test_result_ok():
+            for node in self.nodes_to_cleanup:
+                node.cleanup()
+            self.del_test_dir(self.module_name, self.fname)
+
+        else:
+            for node in self.nodes_to_cleanup:
+                # TODO make decorator with proper stop() vs cleanup()
+                node._try_shutdown(max_attempts=1)
+                # node.cleanup()
+
+        self.nodes_to_cleanup.clear()
+
     @property
     def pg_config_version(self):
         return self.version_to_num(
@@ -369,10 +476,10 @@ class ProbackupTest(object):
         shutil.rmtree(real_base_dir, ignore_errors=True)
         os.makedirs(real_base_dir)
 
-        node = testgres.get_new_node('test', base_dir=real_base_dir)
-        # bound method slow_start() to 'node' class instance
-        node.slow_start = slow_start.__get__(node)
+        node = PostgresNodeExtended(base_dir=real_base_dir)
         node.should_rm_dirs = True
+        self.nodes_to_cleanup.append(node)
+
         return node
 
     def make_simple_node(
@@ -435,6 +542,7 @@ class ProbackupTest(object):
         if node.major_version >= 13:
             self.set_auto_conf(
                 node, {}, 'postgresql.conf', ['wal_keep_segments'])
+
         return node
     
     def simple_bootstrap(self, node, role) -> None:
@@ -874,7 +982,8 @@ class ProbackupTest(object):
                 else:
                     return self.output
         except subprocess.CalledProcessError as e:
-            raise ProbackupException(e.output.decode('utf-8'), self.cmd)
+            raise ProbackupException(e.output.decode('utf-8').replace("\r",""),
+                                     self.cmd)
 
     def run_binary(self, command, asynchronous=False, env=None):
 
@@ -1585,7 +1694,7 @@ class ProbackupTest(object):
             parts.append('0')
         num = 0
         for part in parts:
-            num = num * 100 + int(re.sub("[^\d]", "", part))
+            num = num * 100 + int(re.sub(r"[^\d]", "", part))
         return num
 
     def switch_wal_segment(self, node):
@@ -1648,15 +1757,8 @@ class ProbackupTest(object):
     def get_bin_path(self, binary):
         return testgres.get_bin_path(binary)
 
-    def clean_all(self):
-        for o in gc.get_referrers(testgres.PostgresNode):
-            if o.__class__ is testgres.PostgresNode:
-                o.cleanup()
-
     def del_test_dir(self, module_name, fname):
         """ Del testdir and optimistically try to del module dir"""
-
-        self.clean_all()
 
         shutil.rmtree(
             os.path.join(
@@ -1704,11 +1806,12 @@ class ProbackupTest(object):
 
                 file_fullpath = os.path.join(root, file)
                 file_relpath = os.path.relpath(file_fullpath, pgdata)
-                directory_dict['files'][file_relpath] = {'is_datafile': False}
+                cfile = ContentFile(file.isdigit())
+                directory_dict['files'][file_relpath] = cfile
                 with open(file_fullpath, 'rb') as f:
-                    content = f.read()
                     # truncate cfm's content's zero tail
                     if file_relpath.endswith('.cfm'):
+                        content = f.read()
                         zero64 = b"\x00"*64
                         l = len(content)
                         while l > 64:
@@ -1717,51 +1820,38 @@ class ProbackupTest(object):
                                 break
                             l = s
                         content = content[:l]
-                    directory_dict['files'][file_relpath]['md5'] = hashlib.md5(content).hexdigest()
-#                directory_dict['files'][file_relpath]['md5'] = hashlib.md5(
-#                    f = open(file_fullpath, 'rb').read()).hexdigest()
+                        digest = hashlib.md5(content)
+                    else:
+                        digest = hashlib.md5()
+                        while True:
+                            b = f.read(64*1024)
+                            if not b: break
+                            digest.update(b)
+                    cfile.md5 = digest.hexdigest()
 
                 # crappy algorithm
-                if file.isdigit():
-                    directory_dict['files'][file_relpath]['is_datafile'] = True
+                if cfile.is_datafile:
                     size_in_pages = os.path.getsize(file_fullpath)/8192
-                    directory_dict['files'][file_relpath][
-                        'md5_per_page'] = self.get_md5_per_page_for_fork(
+                    cfile.md5_per_page = self.get_md5_per_page_for_fork(
                             file_fullpath, size_in_pages
                         )
 
-        for root, dirs, files in os.walk(pgdata, topdown=False, followlinks=True):
             for directory in dirs:
                 directory_path = os.path.join(root, directory)
                 directory_relpath = os.path.relpath(directory_path, pgdata)
-
-                found = False
-                for d in dirs_to_ignore:
-                    if d in directory_relpath:
-                        found = True
-                        break
-
-                # check if directory already here as part of larger directory
-                if not found:
-                    for d in directory_dict['dirs']:
-                        # print("OLD dir {0}".format(d))
-                        if directory_relpath in d:
-                            found = True
-                            break
-
-                if not found:
-                    directory_dict['dirs'][directory_relpath] = {}
+                parent = os.path.dirname(directory_relpath)
+                if parent in directory_dict['dirs']:
+                    del directory_dict['dirs'][parent]
+                directory_dict['dirs'][directory_relpath] = ContentDir()
 
         # get permissions for every file and directory
-        for file in directory_dict['dirs']:
-            full_path = os.path.join(pgdata, file)
-            directory_dict['dirs'][file]['mode'] = os.stat(
-                full_path).st_mode
+        for dir, cdir in directory_dict['dirs'].items():
+            full_path = os.path.join(pgdata, dir)
+            cdir.mode = os.stat(full_path).st_mode
 
-        for file in directory_dict['files']:
+        for file, cfile in directory_dict['files'].items():
             full_path = os.path.join(pgdata, file)
-            directory_dict['files'][file]['mode'] = os.stat(
-                full_path).st_mode
+            cfile.mode = os.stat(full_path).st_mode
 
         return directory_dict
 
@@ -1793,123 +1883,117 @@ class ProbackupTest(object):
         error_message = 'Restored PGDATA is not equal to original!\n'
 
         # Compare directories
-        for directory in restored_pgdata['dirs']:
-            if directory not in original_pgdata['dirs']:
-                fail = True
-                error_message += '\nDirectory was not present'
-                error_message += ' in original PGDATA: {0}\n'.format(
-                    os.path.join(restored_pgdata['pgdata'], directory))
-            else:
-                if (
-                    restored_pgdata['dirs'][directory]['mode'] !=
-                    original_pgdata['dirs'][directory]['mode']
-                ):
-                    fail = True
-                    error_message += '\nDir permissions mismatch:\n'
-                    error_message += ' Dir old: {0} Permissions: {1}\n'.format(
-                        os.path.join(original_pgdata['pgdata'], directory),
-                        original_pgdata['dirs'][directory]['mode'])
-                    error_message += ' Dir new: {0} Permissions: {1}\n'.format(
-                        os.path.join(restored_pgdata['pgdata'], directory),
-                        restored_pgdata['dirs'][directory]['mode'])
+        restored_dirs = set(restored_pgdata['dirs'])
+        original_dirs = set(original_pgdata['dirs'])
 
-        for directory in original_pgdata['dirs']:
-            if directory not in restored_pgdata['dirs']:
-                fail = True
-                error_message += '\nDirectory dissappeared'
-                error_message += ' in restored PGDATA: {0}\n'.format(
-                    os.path.join(restored_pgdata['pgdata'], directory))
+        for directory in sorted(restored_dirs - original_dirs):
+            fail = True
+            error_message += '\nDirectory was not present'
+            error_message += ' in original PGDATA: {0}\n'.format(
+                os.path.join(restored_pgdata['pgdata'], directory))
 
-        for file in restored_pgdata['files']:
+        for directory in sorted(original_dirs - restored_dirs):
+            fail = True
+            error_message += '\nDirectory dissappeared'
+            error_message += ' in restored PGDATA: {0}\n'.format(
+                os.path.join(restored_pgdata['pgdata'], directory))
+
+        for directory in sorted(original_dirs & restored_dirs):
+            original = original_pgdata['dirs'][directory]
+            restored = restored_pgdata['dirs'][directory]
+            if original.mode != restored.mode:
+                fail = True
+                error_message += '\nDir permissions mismatch:\n'
+                error_message += ' Dir old: {0} Permissions: {1}\n'.format(
+                    os.path.join(original_pgdata['pgdata'], directory),
+                    original.mode)
+                error_message += ' Dir new: {0} Permissions: {1}\n'.format(
+                    os.path.join(restored_pgdata['pgdata'], directory),
+                    restored.mode)
+
+        restored_files = set(restored_pgdata['files'])
+        original_files = set(original_pgdata['files'])
+
+        for file in sorted(restored_files - original_files):
             # File is present in RESTORED PGDATA
             # but not present in ORIGINAL
             # only backup_label is allowed
-            if file not in original_pgdata['files']:
+            fail = True
+            error_message += '\nFile is not present'
+            error_message += ' in original PGDATA: {0}\n'.format(
+                os.path.join(restored_pgdata['pgdata'], file))
+
+        for file in sorted(original_files - restored_files):
+            error_message += (
+                '\nFile disappearance.\n '
+                'File: {0}\n').format(
+                os.path.join(restored_pgdata['pgdata'], file)
+            )
+            fail = True
+
+        for file in sorted(original_files & restored_files):
+            original = original_pgdata['files'][file]
+            restored = restored_pgdata['files'][file]
+            if restored.mode != original.mode:
                 fail = True
-                error_message += '\nFile is not present'
-                error_message += ' in original PGDATA: {0}\n'.format(
-                    os.path.join(restored_pgdata['pgdata'], file))
+                error_message += '\nFile permissions mismatch:\n'
+                error_message += ' File_old: {0} Permissions: {1:o}\n'.format(
+                    os.path.join(original_pgdata['pgdata'], file),
+                    original.mode)
+                error_message += ' File_new: {0} Permissions: {1:o}\n'.format(
+                    os.path.join(restored_pgdata['pgdata'], file),
+                    restored.mode)
 
-        for file in original_pgdata['files']:
-            if file in restored_pgdata['files']:
-
-                if (
-                    restored_pgdata['files'][file]['mode'] !=
-                    original_pgdata['files'][file]['mode']
-                ):
+            if original.md5 != restored.md5:
+                if file not in exclusion_dict:
                     fail = True
-                    error_message += '\nFile permissions mismatch:\n'
-                    error_message += ' File_old: {0} Permissions: {1:o}\n'.format(
+                    error_message += (
+                        '\nFile Checksum mismatch.\n'
+                        'File_old: {0}\nChecksum_old: {1}\n'
+                        'File_new: {2}\nChecksum_new: {3}\n').format(
                         os.path.join(original_pgdata['pgdata'], file),
-                        original_pgdata['files'][file]['mode'])
-                    error_message += ' File_new: {0} Permissions: {1:o}\n'.format(
+                        original.md5,
                         os.path.join(restored_pgdata['pgdata'], file),
-                        restored_pgdata['files'][file]['mode'])
+                        restored.md5
+                    )
 
-                if (
-                    original_pgdata['files'][file]['md5'] !=
-                    restored_pgdata['files'][file]['md5']
-                ):
-                    if file not in exclusion_dict:
+                if not original.is_datafile:
+                    continue
+
+                original_pages = set(original.md5_per_page)
+                restored_pages = set(restored.md5_per_page)
+
+                for page in sorted(original_pages - restored_pages):
+                    error_message += '\n Page {0} dissappeared.\n File: {1}\n'.format(
+                        page,
+                        os.path.join(restored_pgdata['pgdata'], file)
+                    )
+
+
+                for page in sorted(restored_pages - original_pages):
+                    error_message += '\n Extra page {0}\n File: {1}\n'.format(
+                        page,
+                        os.path.join(restored_pgdata['pgdata'], file))
+
+                for page in sorted(original_pages & restored_pages):
+                    if file in exclusion_dict and page in exclusion_dict[file]:
+                        continue
+
+                    if original.md5_per_page[page] != restored.md5_per_page[page]:
                         fail = True
                         error_message += (
-                            '\nFile Checksum mismatch.\n'
-                            'File_old: {0}\nChecksum_old: {1}\n'
-                            'File_new: {2}\nChecksum_new: {3}\n').format(
-                            os.path.join(original_pgdata['pgdata'], file),
-                            original_pgdata['files'][file]['md5'],
-                            os.path.join(restored_pgdata['pgdata'], file),
-                            restored_pgdata['files'][file]['md5']
-                        )
+                            '\n Page checksum mismatch: {0}\n '
+                            ' PAGE Checksum_old: {1}\n '
+                            ' PAGE Checksum_new: {2}\n '
+                            ' File: {3}\n'
+                        ).format(
+                            page,
+                            original.md5_per_page[page],
+                            restored.md5_per_page[page],
+                            os.path.join(
+                                restored_pgdata['pgdata'], file)
+                            )
 
-                    if original_pgdata['files'][file]['is_datafile']:
-                        for page in original_pgdata['files'][file]['md5_per_page']:
-                            if page not in restored_pgdata['files'][file]['md5_per_page']:
-                                error_message += (
-                                    '\n Page {0} dissappeared.\n '
-                                    'File: {1}\n').format(
-                                        page,
-                                        os.path.join(
-                                            restored_pgdata['pgdata'],
-                                            file
-                                        )
-                                    )
-                                continue
-
-                            if not (file in exclusion_dict and page in exclusion_dict[file]):
-                                if (
-                                    original_pgdata['files'][file]['md5_per_page'][page] !=
-                                    restored_pgdata['files'][file]['md5_per_page'][page]
-                                ):
-                                    fail = True
-                                    error_message += (
-                                        '\n Page checksum mismatch: {0}\n '
-                                        ' PAGE Checksum_old: {1}\n '
-                                        ' PAGE Checksum_new: {2}\n '
-                                        ' File: {3}\n'
-                                    ).format(
-                                        page,
-                                        original_pgdata['files'][file][
-                                            'md5_per_page'][page],
-                                        restored_pgdata['files'][file][
-                                            'md5_per_page'][page],
-                                        os.path.join(
-                                            restored_pgdata['pgdata'], file)
-                                        )
-                        for page in restored_pgdata['files'][file]['md5_per_page']:
-                            if page not in original_pgdata['files'][file]['md5_per_page']:
-                                error_message += '\n Extra page {0}\n File: {1}\n'.format(
-                                    page,
-                                    os.path.join(
-                                        restored_pgdata['pgdata'], file))
-
-            else:
-                error_message += (
-                    '\nFile disappearance.\n '
-                    'File: {0}\n').format(
-                    os.path.join(restored_pgdata['pgdata'], file)
-                    )
-                fail = True
         self.assertFalse(fail, error_message)
 
     def gdb_attach(self, pid):
@@ -1963,7 +2047,7 @@ class GDBobj:
 
         # Get version
         gdb_version_number = re.search(
-            b"^GNU gdb [^\d]*(\d+)\.(\d)",
+            br"^GNU gdb [^\d]*(\d+)\.(\d)",
             gdb_version)
         self.major_version = int(gdb_version_number.group(1))
         self.minor_version = int(gdb_version_number.group(2))
@@ -1977,7 +2061,8 @@ class GDBobj:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
-            universal_newlines=True
+            text=True,
+            errors='replace',
         )
         self.gdb_pid = self.proc.pid
 
@@ -2161,3 +2246,10 @@ class GDBobj:
 #            if running and line.startswith('*running'):
                 break
         return output
+class ContentFile(object):
+    __slots__ = ('is_datafile', 'mode', 'md5', 'md5_per_page')
+    def __init__(self, is_datafile: bool):
+        self.is_datafile = is_datafile
+
+class ContentDir(object):
+    __slots__ = ('mode')

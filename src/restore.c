@@ -76,11 +76,7 @@ static void
 set_orphan_status(parray *backups, pgBackup *parent_backup)
 {
 	/* chain is intact, but at least one parent is invalid */
-	char	*parent_backup_id;
 	int		j;
-
-	/* parent_backup_id is a human-readable backup ID  */
-	parent_backup_id = base36enc_dup(parent_backup->start_time);
 
 	for (j = 0; j < parray_num(backups); j++)
 	{
@@ -96,19 +92,19 @@ set_orphan_status(parray *backups, pgBackup *parent_backup)
 
 				elog(WARNING,
 					"Backup %s is orphaned because his parent %s has status: %s",
-					base36enc(backup->start_time),
-					parent_backup_id,
+					backup_id_of(backup),
+					backup_id_of(parent_backup),
 					status2str(parent_backup->status));
 			}
 			else
 			{
 				elog(WARNING, "Backup %s has parent %s with status: %s",
-						base36enc(backup->start_time), parent_backup_id,
+						backup_id_of(backup),
+						backup_id_of(parent_backup),
 						status2str(parent_backup->status));
 			}
 		}
 	}
-	pg_free(parent_backup_id);
 }
 
 /*
@@ -135,13 +131,14 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 	XLogRecPtr  shift_lsn = InvalidXLogRecPtr;
 
 	if (instanceState == NULL)
-		elog(ERROR, "required parameter not specified: --instance");
+		elog(ERROR, "Required parameter not specified: --instance");
 
 	if (params->is_restore)
 	{
 		if (instance_config.pgdata == NULL)
-			elog(ERROR,
-				"required parameter not specified: PGDATA (-D, --pgdata)");
+			elog(ERROR, "No postgres data directory specified.\n"
+				 "Please specify it either using environment variable PGDATA or\n"
+				 "command line option --pgdata (-D)");
 
 		/* Check if restore destination empty */
 		if (!dir_is_empty(instance_config.pgdata, FIO_DB_HOST))
@@ -243,7 +240,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 			 current_backup->status != BACKUP_STATUS_DONE))
 		{
 			elog(WARNING, "Skipping backup %s, because it has non-valid status: %s",
-				base36enc(current_backup->start_time), status2str(current_backup->status));
+				backup_id_of(current_backup), status2str(current_backup->status));
 			continue;
 		}
 
@@ -273,10 +270,10 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 					current_backup->status == BACKUP_STATUS_RUNNING)
 					&& (!params->no_validate || params->force))
 					elog(WARNING, "Backup %s has status: %s",
-						 base36enc(current_backup->start_time), status2str(current_backup->status));
+						 backup_id_of(current_backup), status2str(current_backup->status));
 				else
 					elog(ERROR, "Backup %s has status: %s",
-						 base36enc(current_backup->start_time), status2str(current_backup->status));
+						 backup_id_of(current_backup), status2str(current_backup->status));
 			}
 
 			if (rt->target_tli)
@@ -294,7 +291,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 				if (!satisfy_timeline(timelines, current_backup->tli, current_backup->stop_lsn))
 				{
 					if (target_backup_id != INVALID_BACKUP_ID)
-						elog(ERROR, "target backup %s does not satisfy target timeline",
+						elog(ERROR, "Target backup %s does not satisfy target timeline",
 							 base36enc(target_backup_id));
 					else
 						/* Try to find another backup that satisfies target timeline */
@@ -348,11 +345,11 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 			/* chain is broken, determine missing backup ID
 			 * and orphinize all his descendants
 			 */
-			char	   *missing_backup_id;
+			const char *missing_backup_id;
 			time_t		missing_backup_start_time;
 
 			missing_backup_start_time = tmp_backup->parent_backup;
-			missing_backup_id = base36enc_dup(tmp_backup->parent_backup);
+			missing_backup_id = base36enc(tmp_backup->parent_backup);
 
 			for (j = 0; j < parray_num(backups); j++)
 			{
@@ -369,18 +366,17 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 						write_backup_status(backup, BACKUP_STATUS_ORPHAN, true);
 
 						elog(WARNING, "Backup %s is orphaned because his parent %s is missing",
-								base36enc(backup->start_time), missing_backup_id);
+								backup_id_of(backup), missing_backup_id);
 					}
 					else
 					{
 						elog(WARNING, "Backup %s has missing parent %s",
-								base36enc(backup->start_time), missing_backup_id);
+								backup_id_of(backup), missing_backup_id);
 					}
 				}
 			}
-			pg_free(missing_backup_id);
 			/* No point in doing futher */
-			elog(ERROR, "%s of backup %s failed.", action, base36enc(dest_backup->start_time));
+			elog(ERROR, "%s of backup %s failed.", action, backup_id_of(dest_backup));
 		}
 		else if (result == ChainIsInvalid)
 		{
@@ -391,7 +387,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 			/* sanity */
 			if (!tmp_backup)
 				elog(ERROR, "Parent full backup for the given backup %s was not found",
-						base36enc(dest_backup->start_time));
+						backup_id_of(dest_backup));
 		}
 
 		/* We have found full backup */
@@ -511,7 +507,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 				if (redo.tli == tmp_backup->tli)
 				{
 					elog(INFO, "Backup %s is chosen as shiftpoint, its Stop LSN will be used as shift LSN",
-						base36enc(tmp_backup->start_time));
+						backup_id_of(tmp_backup));
 
 					shift_lsn = tmp_backup->stop_lsn;
 					break;
@@ -535,7 +531,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 				else
 					elog(INFO, "Backup %s cannot be a shiftpoint, "
 							"because its tli %i is not in history of redo timeline %i",
-						base36enc(tmp_backup->start_time), tmp_backup->tli, redo.tli);
+						backup_id_of(tmp_backup), tmp_backup->tli, redo.tli);
 			}
 
 			tmp_backup = tmp_backup->parent_backup_link;
@@ -544,13 +540,13 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 		if (XLogRecPtrIsInvalid(shift_lsn))
 			elog(ERROR, "Cannot perform incremental restore of backup chain %s in 'lsn' mode, "
 						"because destination directory redo point %X/%X on tli %i is out of reach",
-					base36enc(dest_backup->start_time),
+					backup_id_of(dest_backup),
 					(uint32) (redo.lsn >> 32), (uint32) redo.lsn, redo.tli);
 		else
 			elog(INFO, "Destination directory redo point %X/%X on tli %i is "
 					"within reach of backup %s with Stop LSN %X/%X on tli %i",
 				(uint32) (redo.lsn >> 32), (uint32) redo.lsn, redo.tli,
-				base36enc(tmp_backup->start_time),
+				backup_id_of(tmp_backup),
 				(uint32) (tmp_backup->stop_lsn >> 32), (uint32) tmp_backup->stop_lsn,
 				tmp_backup->tli);
 
@@ -564,7 +560,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 	if (!params->is_restore || !params->no_validate)
 	{
 		if (dest_backup->backup_mode != BACKUP_MODE_FULL)
-			elog(INFO, "Validating parents for backup %s", base36enc(dest_backup->start_time));
+			elog(INFO, "Validating parents for backup %s", backup_id_of(dest_backup));
 
 		/*
 		 * Validate backups from base_full_backup to dest_backup.
@@ -577,7 +573,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 			if (!lock_backup(tmp_backup, true, false))
 			{
 				elog(ERROR, "Cannot lock backup %s directory",
-					 base36enc(tmp_backup->start_time));
+					 backup_id_of(tmp_backup));
 			}
 
 			/* validate datafiles only */
@@ -624,27 +620,27 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 		dest_backup->status == BACKUP_STATUS_DONE)
 	{
 		if (params->no_validate)
-			elog(WARNING, "Backup %s is used without validation.", base36enc(dest_backup->start_time));
+			elog(WARNING, "Backup %s is used without validation.", backup_id_of(dest_backup));
 		else
-			elog(INFO, "Backup %s is valid.", base36enc(dest_backup->start_time));
+			elog(INFO, "Backup %s is valid.", backup_id_of(dest_backup));
 	}
 	else if (dest_backup->status == BACKUP_STATUS_CORRUPT)
 	{
 		if (params->force)
-			elog(WARNING, "Backup %s is corrupt.", base36enc(dest_backup->start_time));
+			elog(WARNING, "Backup %s is corrupt.", backup_id_of(dest_backup));
 		else
-			elog(ERROR, "Backup %s is corrupt.", base36enc(dest_backup->start_time));
+			elog(ERROR, "Backup %s is corrupt.", backup_id_of(dest_backup));
 	}
 	else if (dest_backup->status == BACKUP_STATUS_ORPHAN)
 	{
 		if (params->force)
-			elog(WARNING, "Backup %s is orphan.", base36enc(dest_backup->start_time));
+			elog(WARNING, "Backup %s is orphan.", backup_id_of(dest_backup));
 		else
-			elog(ERROR, "Backup %s is orphan.", base36enc(dest_backup->start_time));
+			elog(ERROR, "Backup %s is orphan.", backup_id_of(dest_backup));
 	}
 	else
 		elog(ERROR, "Backup %s has status: %s",
-				base36enc(dest_backup->start_time), status2str(dest_backup->status));
+				backup_id_of(dest_backup), status2str(dest_backup->status));
 
 	/* We ensured that all backups are valid, now restore if required
 	 */
@@ -668,7 +664,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 		if (rt->lsn_string &&
 			parse_server_version(dest_backup->server_version) < 100000)
 			elog(ERROR, "Backup %s was created for version %s which doesn't support recovery_target_lsn",
-					 base36enc(dest_backup->start_time),
+					 backup_id_of(dest_backup),
 					 dest_backup->server_version);
 
 		restore_chain(dest_backup, parent_chain, dbOid_exclude_list, params,
@@ -683,7 +679,7 @@ do_restore_or_validate(InstanceState *instanceState, time_t target_backup_id, pg
 	fio_disconnect();
 
 	elog(INFO, "%s of backup %s completed.",
-		 action, base36enc(dest_backup->start_time));
+		 action, backup_id_of(dest_backup));
 
 	/* cleanup */
 	parray_walk(backups, pgBackupFree);
@@ -734,17 +730,17 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 		pgBackup   *backup = (pgBackup *) parray_get(parent_chain, i);
 
 		if (!lock_backup(backup, true, false))
-			elog(ERROR, "Cannot lock backup %s", base36enc(backup->start_time));
+			elog(ERROR, "Cannot lock backup %s", backup_id_of(backup));
 
 		if (backup->status != BACKUP_STATUS_OK &&
 			backup->status != BACKUP_STATUS_DONE)
 		{
 			if (params->force)
 				elog(WARNING, "Backup %s is not valid, restore is forced",
-					 base36enc(backup->start_time));
+					 backup_id_of(backup));
 			else
 				elog(ERROR, "Backup %s cannot be restored because it is not valid",
-					 base36enc(backup->start_time));
+					 backup_id_of(backup));
 		}
 
 		/* confirm block size compatibility */
@@ -781,7 +777,7 @@ restore_chain(pgBackup *dest_backup, parray *parent_chain,
 		use_bitmap = false;
 
 		if (params->incremental_mode != INCR_NONE)
-			elog(ERROR, "incremental restore is not possible for backups older than 2.3.0 version");
+			elog(ERROR, "Incremental restore is not possible for backups older than 2.3.0 version");
 	}
 
 	/* There is no point in bitmap restore, when restoring a single FULL backup,
@@ -1484,7 +1480,7 @@ update_recovery_options_before_v12(InstanceState *instanceState, pgBackup *backu
 
 	fp = fio_fopen(path, "w", FIO_DB_HOST);
 	if (fp == NULL)
-		elog(ERROR, "cannot open file \"%s\": %s", path,
+		elog(ERROR, "Cannot open file \"%s\": %s", path,
 			strerror(errno));
 
 	if (fio_chmod(path, FILE_PERMISSION, FIO_DB_HOST) == -1)
@@ -1504,7 +1500,7 @@ update_recovery_options_before_v12(InstanceState *instanceState, pgBackup *backu
 
 	if (fio_fflush(fp) != 0 ||
 		fio_fclose(fp))
-		elog(ERROR, "cannot write file \"%s\": %s", path,
+		elog(ERROR, "Cannot write file \"%s\": %s", path,
 			 strerror(errno));
 }
 #endif
@@ -1543,7 +1539,7 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 	{
 		/* file not found is not an error case */
 		if (errno != ENOENT)
-			elog(ERROR, "cannot stat file \"%s\": %s", postgres_auto_path,
+			elog(ERROR, "Cannot stat file \"%s\": %s", postgres_auto_path,
 				 strerror(errno));
 		st.st_size = 0;
 	}
@@ -1553,13 +1549,13 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 	{
 		fp = fio_open_stream(postgres_auto_path, FIO_DB_HOST);
 		if (fp == NULL)
-			elog(ERROR, "cannot open \"%s\": %s", postgres_auto_path, strerror(errno));
+			elog(ERROR, "Cannot open \"%s\": %s", postgres_auto_path, strerror(errno));
 	}
 
 	sprintf(postgres_auto_path_tmp, "%s.tmp", postgres_auto_path);
 	fp_tmp = fio_fopen(postgres_auto_path_tmp, "w", FIO_DB_HOST);
 	if (fp_tmp == NULL)
-		elog(ERROR, "cannot open \"%s\": %s", postgres_auto_path_tmp, strerror(errno));
+		elog(ERROR, "Cannot open \"%s\": %s", postgres_auto_path_tmp, strerror(errno));
 
 	while (fp && fgets(line, lengthof(line), fp))
 	{
@@ -1617,11 +1613,11 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 	{
 		fp = fio_fopen(postgres_auto_path, "a", FIO_DB_HOST);
 		if (fp == NULL)
-			elog(ERROR, "cannot open file \"%s\": %s", postgres_auto_path,
+			elog(ERROR, "Cannot open file \"%s\": %s", postgres_auto_path,
 				strerror(errno));
 
 		fio_fprintf(fp, "\n# recovery settings added by pg_probackup restore of backup %s at '%s'\n",
-				base36enc(backup->start_time), current_time_str);
+				backup_id_of(backup), current_time_str);
 
 		if (params->recovery_settings_mode == PITR_REQUESTED)
 			print_recovery_settings(instanceState, fp, backup, params, rt);
@@ -1631,7 +1627,7 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 
 		if (fio_fflush(fp) != 0 ||
 			fio_fclose(fp))
-			elog(ERROR, "cannot write file \"%s\": %s", postgres_auto_path,
+			elog(ERROR, "Cannot write file \"%s\": %s", postgres_auto_path,
 				strerror(errno));
 
 		/*
@@ -1651,12 +1647,12 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 
 			fp = fio_fopen(path, PG_BINARY_W, FIO_DB_HOST);
 			if (fp == NULL)
-				elog(ERROR, "cannot open file \"%s\": %s", path,
+				elog(ERROR, "Cannot open file \"%s\": %s", path,
 					strerror(errno));
 
 			if (fio_fflush(fp) != 0 ||
 				fio_fclose(fp))
-				elog(ERROR, "cannot write file \"%s\": %s", path,
+				elog(ERROR, "Cannot write file \"%s\": %s", path,
 					strerror(errno));
 		}
 
@@ -1667,12 +1663,12 @@ update_recovery_options(InstanceState *instanceState, pgBackup *backup,
 
 			fp = fio_fopen(path, PG_BINARY_W, FIO_DB_HOST);
 			if (fp == NULL)
-				elog(ERROR, "cannot open file \"%s\": %s", path,
+				elog(ERROR, "Cannot open file \"%s\": %s", path,
 					strerror(errno));
 
 			if (fio_fflush(fp) != 0 ||
 				fio_fclose(fp))
-				elog(ERROR, "cannot write file \"%s\": %s", path,
+				elog(ERROR, "Cannot write file \"%s\": %s", path,
 					strerror(errno));
 		}
 	}
@@ -1709,12 +1705,12 @@ read_timeline_history(const char *arclog_path, TimeLineID targetTLI, bool strict
 		if (fd == NULL)
 		{
 			if (errno != ENOENT)
-				elog(ERROR, "could not open file \"%s\": %s", path,
+				elog(ERROR, "Could not open file \"%s\": %s", path,
 					strerror(errno));
 
 			/* There is no history file for target timeline */
 			if (strict)
-				elog(ERROR, "recovery target timeline %u does not exist",
+				elog(ERROR, "Recovery target timeline %u does not exist",
 					 targetTLI);
 			else
 				return NULL;
@@ -1748,12 +1744,12 @@ read_timeline_history(const char *arclog_path, TimeLineID targetTLI, bool strict
 		{
 			/* expect a numeric timeline ID as first field of line */
 			elog(ERROR,
-				 "syntax error in history file: %s. Expected a numeric timeline ID.",
+				 "Syntax error in history file: %s. Expected a numeric timeline ID.",
 				   fline);
 		}
 		if (nfields != 3)
 			elog(ERROR,
-				 "syntax error in history file: %s. Expected a transaction log switchpoint location.",
+				 "Syntax error in history file: %s. Expected a transaction log switchpoint location.",
 				   fline);
 
 		if (last_timeline && tli <= last_timeline->tli)
@@ -2031,7 +2027,7 @@ get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 
 	if (!database_map_file)
 		elog(ERROR, "Backup %s doesn't contain a database_map, partial restore is impossible.",
-			base36enc(backup->start_time));
+			backup_id_of(backup));
 
 	join_path_components(path, backup->root_dir, DATABASE_DIR);
 	join_path_components(database_map_path, path, DATABASE_MAP);
@@ -2049,7 +2045,7 @@ get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 	/* partial restore requested but database_map is missing */
 	if (!database_map)
 		elog(ERROR, "Backup %s has empty or mangled database_map, partial restore is impossible.",
-			base36enc(backup->start_time));
+			backup_id_of(backup));
 
 	/*
 	 * So we have a list of datnames and a database_map for it.
@@ -2079,7 +2075,7 @@ get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 			/* If specified datname is not found in database_map, error out */
 			if (!found_match)
 				elog(ERROR, "Failed to find a database '%s' in database_map of backup %s",
-					datname, base36enc(backup->start_time));
+					datname, backup_id_of(backup));
 		}
 
 		/* At this moment only databases to exclude are left in the map */
@@ -2117,14 +2113,14 @@ get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 			/* If specified datname is not found in database_map, error out */
 			if (!found_match)
 				elog(ERROR, "Failed to find a database '%s' in database_map of backup %s",
-					datname, base36enc(backup->start_time));
+					datname, backup_id_of(backup));
 		}
 	}
 
 	/* extra sanity: ensure that list is not empty */
 	if (!dbOid_exclude_list || parray_num(dbOid_exclude_list) < 1)
 		elog(ERROR, "Failed to find a match in database_map of backup %s for partial restore",
-					base36enc(backup->start_time));
+					backup_id_of(backup));
 
 	/* clean backup filelist */
 	if (files)

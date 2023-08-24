@@ -151,7 +151,7 @@ dir_create_dir(const char *dir, mode_t mode, bool strict)
 {
 	char		parent[MAXPGPATH];
 
-	strncpy(parent, dir, MAXPGPATH);
+	strlcpy(parent, dir, MAXPGPATH);
 	get_parent_directory(parent);
 
 	/* Create parent first */
@@ -182,7 +182,7 @@ pgFileNew(const char *path, const char *rel_path, bool follow_symlink,
 		/* file not found is not an error case */
 		if (errno == ENOENT)
 			return NULL;
-		elog(ERROR, "cannot stat file \"%s\": %s", path,
+		elog(ERROR, "Cannot stat file \"%s\": %s", path,
 			strerror(errno));
 	}
 
@@ -787,14 +787,14 @@ opt_path_map(ConfigOption *opt, const char *arg, TablespaceList *list,
 	for (arg_ptr = arg; *arg_ptr; arg_ptr++)
 	{
 		if (dst_ptr - dst >= MAXPGPATH)
-			elog(ERROR, "directory name too long");
+			elog(ERROR, "Directory name too long");
 
 		if (*arg_ptr == '\\' && *(arg_ptr + 1) == '=')
 			;					/* skip backslash escaping = */
 		else if (*arg_ptr == '=' && (arg_ptr == arg || *(arg_ptr - 1) != '\\'))
 		{
 			if (*cell->new_dir)
-				elog(ERROR, "multiple \"=\" signs in %s mapping\n", type);
+				elog(ERROR, "Multiple \"=\" signs in %s mapping\n", type);
 			else
 				dst = dst_ptr = cell->new_dir;
 		}
@@ -803,7 +803,7 @@ opt_path_map(ConfigOption *opt, const char *arg, TablespaceList *list,
 	}
 
 	if (!*cell->old_dir || !*cell->new_dir)
-		elog(ERROR, "invalid %s mapping format \"%s\", "
+		elog(ERROR, "Invalid %s mapping format \"%s\", "
 			 "must be \"OLDDIR=NEWDIR\"", type, arg);
 	canonicalize_path(cell->old_dir);
 	canonicalize_path(cell->new_dir);
@@ -815,11 +815,11 @@ opt_path_map(ConfigOption *opt, const char *arg, TablespaceList *list,
 	 * consistent with the new_dir check.
 	 */
 	if (!is_absolute_path(cell->old_dir))
-		elog(ERROR, "old directory is not an absolute path in %s mapping: %s\n",
+		elog(ERROR, "Old directory is not an absolute path in %s mapping: %s\n",
 			 type, cell->old_dir);
 
 	if (!is_absolute_path(cell->new_dir))
-		elog(ERROR, "new directory is not an absolute path in %s mapping: %s\n",
+		elog(ERROR, "New directory is not an absolute path in %s mapping: %s\n",
 			 type, cell->new_dir);
 
 	if (list->tail)
@@ -964,7 +964,7 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
 		if (links)
 		{
 			/* get parent dir of rel_path */
-			strncpy(parent_dir, dir->rel_path, MAXPGPATH);
+			strlcpy(parent_dir, dir->rel_path, MAXPGPATH);
 			get_parent_directory(parent_dir);
 
 			/* check if directory is actually link to tablespace */
@@ -1046,7 +1046,7 @@ read_tablespace_map(parray *links, const char *backup_dir)
 		int         i = 0;
 
 		if (sscanf(buf, "%s %n", link_name, &n) != 1)
-			elog(ERROR, "invalid format found in \"%s\"", map_path);
+			elog(ERROR, "Invalid format found in \"%s\"", map_path);
 
 		path = buf + n;
 
@@ -1101,7 +1101,7 @@ check_tablespace_mapping(pgBackup *backup, bool incremental, bool force, bool pg
 	bool        tblspaces_are_empty = true;
 
 	elog(LOG, "Checking tablespace directories of backup %s",
-			base36enc(backup->start_time));
+			backup_id_of(backup));
 
 	/* validate tablespace map,
 	 * if there are no tablespaces, then there is nothing left to do
@@ -1115,7 +1115,7 @@ check_tablespace_mapping(pgBackup *backup, bool incremental, bool force, bool pg
 		 */
 		if (tablespace_dirs.head != NULL)
 			elog(ERROR, "Backup %s has no tablespaceses, nothing to remap "
-					"via \"--tablespace-mapping\" option", base36enc(backup->backup_id));
+					"via \"--tablespace-mapping\" option", backup_id_of(backup));
 		return NoTblspc;
 	}
 
@@ -1250,7 +1250,7 @@ check_external_dir_mapping(pgBackup *backup, bool incremental)
 	int		i;
 
 	elog(LOG, "check external directories of backup %s",
-			base36enc(backup->start_time));
+			backup_id_of(backup));
 
 	if (!backup->external_dir_str)
 	{
@@ -1438,7 +1438,7 @@ get_control_value_str(const char *str, const char *name,
 				{
 					/* verify if value_str not exceeds value_str_size limits */
 					if (value_str - value_str_start >= value_str_size - 1) {
-						elog(ERROR, "field \"%s\" is out of range in the line %s of the file %s",
+						elog(ERROR, "Field \"%s\" is out of range in the line %s of the file %s",
 							 name, str, DATABASE_FILE_LIST);
 					}
 					*value_str = *buf;
@@ -1463,7 +1463,7 @@ get_control_value_str(const char *str, const char *name,
 
 	/* Did not find target field */
 	if (is_mandatory)
-		elog(ERROR, "field \"%s\" is not found in the line %s of the file %s",
+		elog(ERROR, "Field \"%s\" is not found in the line %s of the file %s",
 			 name, str, DATABASE_FILE_LIST);
 	return false;
 }
@@ -1490,7 +1490,7 @@ dir_is_empty(const char *path, fio_location location)
 		/* Directory in path doesn't exist */
 		if (errno == ENOENT)
 			return true;
-		elog(ERROR, "cannot open directory \"%s\": %s", path, strerror(errno));
+		elog(ERROR, "Cannot open directory \"%s\": %s", path, strerror(errno));
 	}
 
 	errno = 0;
@@ -1506,7 +1506,7 @@ dir_is_empty(const char *path, fio_location location)
 		return false;
 	}
 	if (errno)
-		elog(ERROR, "cannot read directory \"%s\": %s", path, strerror(errno));
+		elog(ERROR, "Cannot read directory \"%s\": %s", path, strerror(errno));
 
 	fio_closedir(dir);
 
@@ -1837,7 +1837,19 @@ set_forkname(pgFile *file)
 			return false;
 	}
 
-	/* CFS "fork name" */
+	/* CFS family fork names */
+	if (file->forkName == none &&
+		is_forkname(file->name, &i, ".cfm.bck"))
+	{
+		/* /^\d+(\.\d+)?\.cfm\.bck$/ */
+		file->forkName = cfm_bck;
+	}
+	if (file->forkName == none &&
+		is_forkname(file->name, &i, ".bck"))
+	{
+		/* /^\d+(\.\d+)?\.bck$/ */
+		file->forkName = cfs_bck;
+	}
 	if (file->forkName == none &&
 		is_forkname(file->name, &i, ".cfm"))
 	{

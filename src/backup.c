@@ -13,6 +13,9 @@
 #if PG_VERSION_NUM < 110000
 #include "catalog/catalog.h"
 #endif
+#if PG_VERSION_NUM < 120000
+#include "access/transam.h"
+#endif
 #include "catalog/pg_tablespace.h"
 #include "pgtar.h"
 #include "streamutil.h"
@@ -65,7 +68,10 @@ static bool pg_is_in_recovery(PGconn *conn);
 static bool pg_is_superuser(PGconn *conn);
 static void check_server_version(PGconn *conn, PGNodeInfo *nodeInfo);
 static void confirm_block_size(PGconn *conn, const char *name, int blcksz);
-static void set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i);
+static void rewind_and_mark_cfs_datafiles(parray *files, const char *root, char *relative, size_t i);
+static bool remove_excluded_files_criterion(void *value, void *exclude_args);
+static void backup_cfs_segment(int i, pgFile *file, backup_files_arg *arguments);
+static void process_file(int i, pgFile *file, backup_files_arg *arguments);
 
 static StopBackupCallbackParams stop_callback_params;
 
@@ -78,7 +84,7 @@ backup_stopbackup_callback(bool fatal, void *userdata)
 	 */
 	if (backup_in_progress)
 	{
-		elog(WARNING, "backup in progress, stop backup");
+		elog(WARNING, "A backup is in progress, stopping it.");
 		/* don't care about stop_lsn in case of error */
 		pg_stop_backup_send(st->conn, st->server_version, current.from_replica, exclusive_backup, NULL);
 	}
@@ -190,9 +196,9 @@ do_backup_pg(InstanceState *instanceState, PGconn *backup_conn,
 			elog(ERROR, "pg_probackup binary version is %s, but backup %s version is %s. "
 						"pg_probackup do not guarantee to be forward compatible. "
 						"Please upgrade pg_probackup binary.",
-						PROGRAM_VERSION, base36enc(prev_backup->start_time), prev_backup->program_version);
+						PROGRAM_VERSION, backup_id_of(prev_backup), prev_backup->program_version);
 
-		elog(INFO, "Parent backup: %s", base36enc(prev_backup->start_time));
+		elog(INFO, "Parent backup: %s", backup_id_of(prev_backup));
 
 		/* Files of previous backup needed by DELTA backup */
 		prev_backup_filelist = get_backup_filelist(prev_backup, true);
@@ -233,7 +239,7 @@ do_backup_pg(InstanceState *instanceState, PGconn *backup_conn,
 				"It may indicate that we are trying to backup PostgreSQL instance from the past.",
 				(uint32) (current.start_lsn >> 32), (uint32) (current.start_lsn),
 				(uint32) (prev_backup->start_lsn >> 32), (uint32) (prev_backup->start_lsn),
-				base36enc(prev_backup->start_time));
+				backup_id_of(prev_backup));
 
 	/* Update running backup meta with START LSN */
 	write_backup(&current, true);
@@ -604,7 +610,7 @@ do_backup_pg(InstanceState *instanceState, PGconn *backup_conn,
 				"It may indicate that we are trying to backup PostgreSQL instance from the past.",
 				(uint32) (current.stop_lsn >> 32), (uint32) (current.stop_lsn),
 				(uint32) (prev_backup->stop_lsn >> 32), (uint32) (prev_backup->stop_lsn),
-				base36enc(prev_backup->stop_lsn));
+				backup_id_of(prev_backup));
 
 	/* clean external directories list */
 	if (external_dirs)
@@ -705,8 +711,9 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 	char		pretty_bytes[20];
 
 	if (!instance_config.pgdata)
-		elog(ERROR, "required parameter not specified: PGDATA "
-						 "(-D, --pgdata)");
+		elog(ERROR, "No postgres data directory specified.\n"
+			 "Please specify it either using environment variable PGDATA or\n"
+			 "command line option --pgdata (-D)");
 
 	/* Initialize PGInfonode */
 	pgNodeInit(&nodeInfo);
@@ -735,7 +742,7 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 			/* don't care about freeing base36enc_dup memory, we exit anyway */
 			elog(ERROR, "Can't assign backup_id from requested start_time (%s), "
 						"this time must be later that backup %s",
-				base36enc_dup(start_time), base36enc_dup(latest_backup_id));
+				base36enc(start_time), base36enc(latest_backup_id));
 
 		current.backup_id = start_time;
 		pgBackupInitDir(&current, instanceState->instance_backup_subdir_path);
@@ -768,6 +775,7 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 
 	/* Update backup status and other metainfo. */
 	current.status = BACKUP_STATUS_RUNNING;
+	/* XXX BACKUP_ID change it when backup_id wouldn't match start_time */
 	current.start_time = current.backup_id;
 
 	strlcpy(current.program_version, PROGRAM_VERSION,
@@ -778,13 +786,13 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 
 	elog(INFO, "Backup start, pg_probackup version: %s, instance: %s, backup ID: %s, backup mode: %s, "
 			"wal mode: %s, remote: %s, compress-algorithm: %s, compress-level: %i",
-			PROGRAM_VERSION, instanceState->instance_name, base36enc(current.backup_id), pgBackupGetBackupMode(&current, false),
+			PROGRAM_VERSION, instanceState->instance_name, backup_id_of(&current), pgBackupGetBackupMode(&current, false),
 			current.stream ? "STREAM" : "ARCHIVE", IsSshProtocol()  ? "true" : "false",
 			deparse_compress_alg(current.compress_alg), current.compress_level);
 
 	if (!lock_backup(&current, true, true))
 		elog(ERROR, "Cannot lock backup %s directory",
-			 base36enc(current.backup_id));
+			 backup_id_of(&current));
 	write_backup(&current, true);
 
 	/* set the error processing function for the backup process */
@@ -799,7 +807,7 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 	backup_conn = pgdata_basic_setup(instance_config.conn_opt, &nodeInfo);
 
 	if (current.from_replica)
-		elog(INFO, "Backup %s is going to be taken from standby", base36enc(current.backup_id));
+		elog(INFO, "Backup %s is going to be taken from standby", backup_id_of(&current));
 
 	/* TODO, print PostgreSQL full version */
 	//elog(INFO, "PostgreSQL version: %s", nodeInfo.server_version_str);
@@ -887,13 +895,13 @@ do_backup(InstanceState *instanceState, pgSetBackupParams *set_backup_params,
 		pretty_size(current.data_bytes + current.wal_bytes, pretty_bytes, lengthof(pretty_bytes));
 	else
 		pretty_size(current.data_bytes, pretty_bytes, lengthof(pretty_bytes));
-	elog(INFO, "Backup %s resident size: %s", base36enc(current.start_time), pretty_bytes);
+	elog(INFO, "Backup %s resident size: %s", backup_id_of(&current), pretty_bytes);
 
 	if (current.status == BACKUP_STATUS_OK ||
 		current.status == BACKUP_STATUS_DONE)
-		elog(INFO, "Backup %s completed", base36enc(current.start_time));
+		elog(INFO, "Backup %s completed", backup_id_of(&current));
 	else
-		elog(ERROR, "Backup %s failed", base36enc(current.start_time));
+		elog(ERROR, "Backup %s failed", backup_id_of(&current));
 
 	/*
 	 * After successful backup completion remove backups
@@ -929,12 +937,12 @@ check_server_version(PGconn *conn, PGNodeInfo *nodeInfo)
 
 	if (nodeInfo->server_version < 90500)
 		elog(ERROR,
-			 "server version is %s, must be %s or higher",
+			 "Server version is %s, must be %s or higher",
 			 nodeInfo->server_version_str, "9.5");
 
 	if (current.from_replica && nodeInfo->server_version < 90600)
 		elog(ERROR,
-			 "server version is %s, must be %s or higher for backup from replica",
+			 "Server version is %s, must be %s or higher for backup from replica",
 			 nodeInfo->server_version_str, "9.6");
 
 	if (nodeInfo->pgpro_support)
@@ -1043,7 +1051,7 @@ confirm_block_size(PGconn *conn, const char *name, int blcksz)
 
 	res = pgut_execute(conn, "SELECT pg_catalog.current_setting($1)", 1, &name);
 	if (PQntuples(res) != 1 || PQnfields(res) != 1)
-		elog(ERROR, "cannot get %s: %s", name, PQerrorMessage(conn));
+		elog(ERROR, "Cannot get %s: %s", name, PQerrorMessage(conn));
 
 	block_size = strtol(PQgetvalue(res, 0, 0), &endp, 10);
 	if ((endp && *endp) || block_size != blcksz)
@@ -1432,7 +1440,7 @@ wait_wal_lsn(const char *wal_segment_dir, XLogRecPtr target_lsn, bool is_start_l
 		}
 
 		if (!current.stream && is_start_lsn && try_count == 30)
-			elog(WARNING, "By default pg_probackup assume WAL delivery method to be ARCHIVE. "
+			elog(WARNING, "By default pg_probackup assumes that WAL delivery method to be ARCHIVE. "
 				 "If continuous archiving is not set up, use '--stream' option to make autonomous backup. "
 				 "Otherwise check that continuous archiving works correctly.");
 
@@ -1768,9 +1776,9 @@ pg_stop_backup_consume(PGconn *conn, int server_version,
 			{
 				pgut_cancel(conn);
 #if PG_VERSION_NUM >= 150000
-				elog(ERROR, "interrupted during waiting for pg_backup_stop");
+				elog(ERROR, "Interrupted during waiting for pg_backup_stop");
 #else
-				elog(ERROR, "interrupted during waiting for pg_stop_backup");
+				elog(ERROR, "Interrupted during waiting for pg_stop_backup");
 #endif
 			}
 
@@ -1816,7 +1824,7 @@ pg_stop_backup_consume(PGconn *conn, int server_version,
 			case PGRES_TUPLES_OK:
 				break;
 			default:
-				elog(ERROR, "query failed: %s query was: %s",
+				elog(ERROR, "Query failed: %s query was: %s",
 					 PQerrorMessage(conn), query_text);
 		}
 		backup_in_progress = false;
@@ -1827,13 +1835,13 @@ pg_stop_backup_consume(PGconn *conn, int server_version,
 	/* get&check recovery_xid */
 	if (sscanf(PQgetvalue(query_result, 0, recovery_xid_colno), XID_FMT, &result->snapshot_xid) != 1)
 		elog(ERROR,
-			 "result of txid_snapshot_xmax() is invalid: %s",
+			 "Result of txid_snapshot_xmax() is invalid: %s",
 			 PQgetvalue(query_result, 0, recovery_xid_colno));
 
 	/* get&check recovery_time */
 	if (!parse_time(PQgetvalue(query_result, 0, recovery_time_colno), &result->invocation_time, true))
 		elog(ERROR,
-			 "result of current_timestamp is invalid: %s",
+			 "Result of current_timestamp is invalid: %s",
 			 PQgetvalue(query_result, 0, recovery_time_colno));
 
 	/* get stop_backup_lsn */
@@ -1891,13 +1899,13 @@ pg_stop_backup_write_file_helper(const char *path, const char *filename, const c
 	join_path_components(full_filename, path, filename);
 	fp = fio_fopen(full_filename, PG_BINARY_W, FIO_BACKUP_HOST);
 	if (fp == NULL)
-		elog(ERROR, "can't open %s file \"%s\": %s",
+		elog(ERROR, "Can't open %s file \"%s\": %s",
 			 error_msg_filename, full_filename, strerror(errno));
 
 	if (fio_fwrite(fp, data, len) != len ||
 		fio_fflush(fp) != 0 ||
 		fio_fclose(fp))
-		elog(ERROR, "can't write %s file \"%s\": %s",
+		elog(ERROR, "Can't write %s file \"%s\": %s",
 			 error_msg_filename, full_filename, strerror(errno));
 
 	/*
@@ -1936,7 +1944,7 @@ pg_stop_backup(InstanceState *instanceState, pgBackup *backup, PGconn *pg_startb
 
 	/* Remove it ? */
 	if (!backup_in_progress)
-		elog(ERROR, "backup is not in progress");
+		elog(ERROR, "Backup is not in progress");
 
 	pg_silent_client_messages(pg_startbackup_conn);
 
@@ -2034,7 +2042,7 @@ backup_cleanup(bool fatal, void *userdata)
 	if (current.status == BACKUP_STATUS_RUNNING && current.end_time == 0)
 	{
 		elog(WARNING, "Backup %s is running, setting its status to ERROR",
-			 base36enc(current.start_time));
+			 backup_id_of(&current));
 		current.end_time = time(NULL);
 		current.status = BACKUP_STATUS_ERROR;
 		write_backup(&current, true);
@@ -2053,8 +2061,6 @@ static void *
 backup_files(void *arg)
 {
 	int			i;
-	char		from_fullpath[MAXPGPATH];
-	char		to_fullpath[MAXPGPATH];
 	static time_t prev_time;
 
 	backup_files_arg *arguments = (backup_files_arg *) arg;
@@ -2066,7 +2072,6 @@ backup_files(void *arg)
 	for (i = 0; i < n_backup_files_list; i++)
 	{
 		pgFile	*file = (pgFile *) parray_get(arguments->files_list, i);
-		pgFile	*prev_file = NULL;
 
 		/* We have already copied all directories */
 		if (S_ISDIR(file->mode))
@@ -2086,90 +2091,27 @@ backup_files(void *arg)
 			}
 		}
 
+		if (file->skip_cfs_nested)
+			continue;
+
 		if (!pg_atomic_test_set_flag(&file->lock))
 			continue;
 
 		/* check for interrupt */
 		if (interrupted || thread_interrupted)
-			elog(ERROR, "interrupted during backup");
+			elog(ERROR, "Interrupted during backup");
 
 		elog(progress ? INFO : LOG, "Progress: (%d/%d). Process file \"%s\"",
 			 i + 1, n_backup_files_list, file->rel_path);
 
-		/* Handle zero sized files */
-		if (file->size == 0)
+		if (file->is_cfs)
 		{
-			file->write_size = 0;
-			continue;
-		}
-
-		/* construct destination filepath */
-		if (file->external_dir_num == 0)
-		{
-			join_path_components(from_fullpath, arguments->from_root, file->rel_path);
-			join_path_components(to_fullpath, arguments->to_root, file->rel_path);
+			backup_cfs_segment(i, file, arguments);
 		}
 		else
 		{
-			char 	external_dst[MAXPGPATH];
-			char	*external_path = parray_get(arguments->external_dirs,
-												file->external_dir_num - 1);
-
-			makeExternalDirPathByNum(external_dst,
-								 arguments->external_prefix,
-								 file->external_dir_num);
-
-			join_path_components(to_fullpath, external_dst, file->rel_path);
-			join_path_components(from_fullpath, external_path, file->rel_path);
+			process_file(i, file, arguments);
 		}
-
-		/* Encountered some strange beast */
-		if (!S_ISREG(file->mode))
-			elog(WARNING, "Unexpected type %d of file \"%s\", skipping",
-							file->mode, from_fullpath);
-
-		/* Check that file exist in previous backup */
-		if (current.backup_mode != BACKUP_MODE_FULL)
-		{
-			pgFile	**prev_file_tmp = NULL;
-			prev_file_tmp = (pgFile **) parray_bsearch(arguments->prev_filelist,
-											file, pgFileCompareRelPathWithExternal);
-			if (prev_file_tmp)
-			{
-				/* File exists in previous backup */
-				file->exists_in_prev = true;
-				prev_file = *prev_file_tmp;
-			}
-		}
-
-		/* backup file */
-		if (file->is_datafile && !file->is_cfs)
-		{
-			backup_data_file(file, from_fullpath, to_fullpath,
-							 arguments->prev_start_lsn,
-							 current.backup_mode,
-							 instance_config.compress_alg,
-							 instance_config.compress_level,
-							 arguments->nodeInfo->checksum_version,
-							 arguments->hdr_map, false);
-		}
-		else
-		{
-			backup_non_data_file(file, prev_file, from_fullpath, to_fullpath,
-								 current.backup_mode, current.parent_backup, true);
-		}
-
-		if (file->write_size == FILE_NOT_FOUND)
-			continue;
-
-		if (file->write_size == BYTES_INVALID)
-		{
-			elog(LOG, "Skipping the unchanged file: \"%s\"", from_fullpath);
-			continue;
-		}
-
-		elog(LOG, "File \"%s\". Copied "INT64_FORMAT " bytes",
-						from_fullpath, file->write_size);
 	}
 
 	/* ssh connection to longer needed */
@@ -2179,6 +2121,149 @@ backup_files(void *arg)
 	arguments->ret = 0;
 
 	return NULL;
+}
+
+static void
+process_file(int i, pgFile *file, backup_files_arg *arguments)
+{
+	char		from_fullpath[MAXPGPATH];
+	char		to_fullpath[MAXPGPATH];
+	pgFile	   *prev_file = NULL;
+
+	elog(progress ? INFO : LOG, "Progress: (%d/%zu). Process file \"%s\"",
+		 i + 1, parray_num(arguments->files_list), file->rel_path);
+
+	/* Handle zero sized files */
+	if (file->size == 0)
+	{
+		file->write_size = 0;
+		return;
+	}
+
+	/* construct from_fullpath & to_fullpath */
+	if (file->external_dir_num == 0)
+	{
+		join_path_components(from_fullpath, arguments->from_root, file->rel_path);
+		join_path_components(to_fullpath, arguments->to_root, file->rel_path);
+	}
+	else
+	{
+		char 	external_dst[MAXPGPATH];
+		char	*external_path = parray_get(arguments->external_dirs,
+										file->external_dir_num - 1);
+
+		makeExternalDirPathByNum(external_dst,
+								 arguments->external_prefix,
+								 file->external_dir_num);
+
+		join_path_components(to_fullpath, external_dst, file->rel_path);
+		join_path_components(from_fullpath, external_path, file->rel_path);
+	}
+
+	/* Encountered some strange beast */
+	if (!S_ISREG(file->mode))
+	{
+		elog(WARNING, "Unexpected type %d of file \"%s\", skipping",
+			 				file->mode, from_fullpath);
+		return;
+	}
+
+	/* Check that file exist in previous backup */
+	if (current.backup_mode != BACKUP_MODE_FULL)
+	{
+		pgFile **prevFileTmp = NULL;
+		prevFileTmp = (pgFile **) parray_bsearch(arguments->prev_filelist,
+												 file, pgFileCompareRelPathWithExternal);
+		if (prevFileTmp)
+		{
+			/* File exists in previous backup */
+			file->exists_in_prev = true;
+			prev_file = *prevFileTmp;
+		}
+	}
+
+	/* backup file */
+	if (file->is_datafile && !file->is_cfs)
+	{
+		backup_data_file(file, from_fullpath, to_fullpath,
+						 arguments->prev_start_lsn,
+						 current.backup_mode,
+						 instance_config.compress_alg,
+						 instance_config.compress_level,
+						 arguments->nodeInfo->checksum_version,
+						 arguments->hdr_map, false);
+	}
+	else
+	{
+		backup_non_data_file(file, prev_file, from_fullpath, to_fullpath,
+							 current.backup_mode, current.parent_backup, true);
+	}
+
+	if (file->write_size == FILE_NOT_FOUND)
+		return;
+
+	if (file->write_size == BYTES_INVALID)
+	{
+		elog(LOG, "Skipping the unchanged file: \"%s\"", from_fullpath);
+		return;
+	}
+
+	elog(LOG, "File \"%s\". Copied "INT64_FORMAT " bytes",
+		 				from_fullpath, file->write_size);
+
+}
+
+static void
+backup_cfs_segment(int i, pgFile *file, backup_files_arg *arguments) {
+	pgFile	*data_file = file;
+	pgFile	*cfm_file = NULL;
+	pgFile	*data_bck_file = NULL;
+	pgFile	*cfm_bck_file = NULL;
+
+	while (data_file->cfs_chain)
+	{
+		data_file = data_file->cfs_chain;
+		if (data_file->forkName == cfm)
+			cfm_file = data_file;
+		if (data_file->forkName == cfs_bck)
+			data_bck_file = data_file;
+		if (data_file->forkName == cfm_bck)
+			cfm_bck_file = data_file;
+	}
+	data_file = file;
+	if (data_file->relOid >= FirstNormalObjectId && cfm_file == NULL)
+	{
+		elog(ERROR, "'CFS' file '%s' have to have '%s.cfm' companion file",
+			 data_file->rel_path, data_file->name);
+	}
+
+	elog(LOG, "backup CFS segment %s, data_file=%s, cfm_file=%s, data_bck_file=%s, cfm_bck_file=%s",
+		 data_file->name, data_file->name, cfm_file->name, data_bck_file == NULL? "NULL": data_bck_file->name, cfm_bck_file == NULL? "NULL": cfm_bck_file->name);
+
+	/* storing cfs segment. processing corner case [PBCKP-287] stage 1.
+	 * - when we do have data_bck_file we should skip both data_bck_file and cfm_bck_file if exists.
+	 *   they are removed by cfs_recover() during postgres start.
+	 */
+	if (data_bck_file)
+	{
+		if (cfm_bck_file)
+			cfm_bck_file->write_size = FILE_NOT_FOUND;
+		data_bck_file->write_size = FILE_NOT_FOUND;
+	}
+	/* else we store cfm_bck_file. processing corner case [PBCKP-287] stage 2.
+	 * - when we do have cfm_bck_file only we should store it.
+	 *   it will replace cfm_file after postgres start.
+	 */
+	else if (cfm_bck_file)
+		process_file(i, cfm_bck_file, arguments);
+
+	/* storing cfs segment in order cfm_file -> datafile to guarantee their consistency */
+	/* cfm_file could be NULL for system tables. But we don't clear is_cfs flag
+	 * for compatibility with older pg_probackup. */
+	if (cfm_file)
+		process_file(i, cfm_file, arguments);
+	process_file(i, data_file, arguments);
+	elog(LOG, "Backup CFS segment %s done", data_file->name);
 }
 
 /*
@@ -2208,11 +2293,12 @@ parse_filelist_filenames(parray *files, const char *root)
 			 */
 			if (strcmp(file->name, "pg_compression") == 0)
 			{
+				/* processing potential cfs tablespace */
 				Oid			tblspcOid;
 				Oid			dbOid;
 				char		tmp_rel_path[MAXPGPATH];
 				/*
-				 * Check that the file is located under
+				 * Check that pg_compression is located under
 				 * TABLESPACE_VERSION_DIRECTORY
 				 */
 				sscanf_result = sscanf(file->rel_path, PG_TBLSPC_DIR "/%u/%s/%u",
@@ -2221,8 +2307,10 @@ parse_filelist_filenames(parray *files, const char *root)
 				/* Yes, it is */
 				if (sscanf_result == 2 &&
 					strncmp(tmp_rel_path, TABLESPACE_VERSION_DIRECTORY,
-							strlen(TABLESPACE_VERSION_DIRECTORY)) == 0)
-					set_cfs_datafiles(files, root, file->rel_path, i);
+							strlen(TABLESPACE_VERSION_DIRECTORY)) == 0) {
+					/* rewind index to the beginning of cfs tablespace */
+					rewind_and_mark_cfs_datafiles(files, root, file->rel_path, i);
+				}
 			}
 		}
 
@@ -2237,7 +2325,7 @@ parse_filelist_filenames(parray *files, const char *root)
 				 */
 				int			unlogged_file_num = i - 1;
 				pgFile	   *unlogged_file = (pgFile *) parray_get(files,
-																  unlogged_file_num);
+														  unlogged_file_num);
 
 				unlogged_file_reloid = file->relOid;
 
@@ -2245,11 +2333,10 @@ parse_filelist_filenames(parray *files, const char *root)
 					   (unlogged_file_reloid != 0) &&
 					   (unlogged_file->relOid == unlogged_file_reloid))
 				{
-					pgFileFree(unlogged_file);
-					parray_remove(files, unlogged_file_num);
+					/* flagged to remove from list on stage 2 */
+					unlogged_file->remove_from_list = true;
 
 					unlogged_file_num--;
-					i--;
 
 					unlogged_file = (pgFile *) parray_get(files,
 														  unlogged_file_num);
@@ -2259,6 +2346,22 @@ parse_filelist_filenames(parray *files, const char *root)
 
 		i++;
 	}
+
+	/* stage 2. clean up from temporary tables */
+	parray_remove_if(files, remove_excluded_files_criterion, NULL, pgFileFree);
+}
+
+static bool
+remove_excluded_files_criterion(void *value, void *exclude_args) {
+	pgFile	*file = (pgFile*)value;
+	return file->remove_from_list;
+}
+
+static uint32
+hash_rel_seg(pgFile* file)
+{
+	uint32 hash = hash_mix32_2(file->relOid, file->segno);
+	return hash_mix32_2(hash, 0xcf5);
 }
 
 /* If file is equal to pg_compression, then we consider this tablespace as
@@ -2272,14 +2375,27 @@ parse_filelist_filenames(parray *files, const char *root)
  * tblspcOid/TABLESPACE_VERSION_DIRECTORY/dboid/1
  * tblspcOid/TABLESPACE_VERSION_DIRECTORY/dboid/1.cfm
  * tblspcOid/TABLESPACE_VERSION_DIRECTORY/pg_compression
+ *
+ * @returns index of first tablespace entry, i.e tblspcOid/TABLESPACE_VERSION_DIRECTORY
  */
 static void
-set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
+rewind_and_mark_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
 {
 	int			len;
 	int			p;
+	int			j;
 	pgFile	   *prev_file;
+	pgFile	   *tmp_file;
 	char	   *cfs_tblspc_path;
+	uint32		h;
+
+	/* hash table for cfm files */
+#define HASHN 128
+	parray	   *hashtab[HASHN] = {NULL};
+	parray     *bucket;
+	for (p = 0; p < HASHN; p++)
+		hashtab[p] = parray_new();
+
 
 	cfs_tblspc_path = strdup(relative);
 	if(!cfs_tblspc_path)
@@ -2294,21 +2410,60 @@ set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i)
 
 		elog(LOG, "Checking file in cfs tablespace %s", prev_file->rel_path);
 
-		if (strstr(prev_file->rel_path, cfs_tblspc_path) != NULL)
-		{
-			if (S_ISREG(prev_file->mode) && prev_file->is_datafile)
-			{
-				elog(LOG, "Setting 'is_cfs' on file %s, name %s",
-					prev_file->rel_path, prev_file->name);
-				prev_file->is_cfs = true;
-			}
-		}
-		else
+		if (strstr(prev_file->rel_path, cfs_tblspc_path) == NULL)
 		{
 			elog(LOG, "Breaking on %s", prev_file->rel_path);
 			break;
 		}
+
+		if (!S_ISREG(prev_file->mode))
+			continue;
+
+		h = hash_rel_seg(prev_file);
+		bucket = hashtab[h % HASHN];
+
+		if (prev_file->forkName == cfm || prev_file->forkName == cfm_bck ||
+			prev_file->forkName == cfs_bck)
+		{
+			prev_file->skip_cfs_nested = true;
+			parray_append(bucket, prev_file);
+		}
+		else if (prev_file->is_datafile && prev_file->forkName == none)
+		{
+			elog(LOG, "Processing 'cfs' file %s", prev_file->rel_path);
+			/* have to mark as is_cfs even for system-tables for compatibility
+			 * with older pg_probackup */
+			prev_file->is_cfs = true;
+			prev_file->cfs_chain = NULL;
+			for (j = 0; j < parray_num(bucket); j++)
+			{
+				tmp_file = parray_get(bucket, j);
+				elog(LOG, "Linking 'cfs' file '%s' to '%s'",
+					 tmp_file->rel_path, prev_file->rel_path);
+				if (tmp_file->relOid == prev_file->relOid &&
+					tmp_file->segno == prev_file->segno)
+				{
+					tmp_file->cfs_chain = prev_file->cfs_chain;
+					prev_file->cfs_chain = tmp_file;
+					parray_remove(bucket, j);
+					j--;
+				}
+			}
+		}
 	}
+
+	for (p = 0; p < HASHN; p++)
+	{
+		bucket = hashtab[p];
+		for (j = 0; j < parray_num(bucket); j++)
+		{
+			tmp_file = parray_get(bucket, j);
+			elog(WARNING, "Orphaned cfs related file '%s'", tmp_file->rel_path);
+		}
+		parray_free(bucket);
+		hashtab[p] = NULL;
+	}
+#undef HASHN
 	free(cfs_tblspc_path);
 }
 

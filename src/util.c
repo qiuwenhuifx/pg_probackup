@@ -32,38 +32,22 @@ static const char *statusName[] =
 };
 
 const char *
-base36enc(long unsigned int value)
+base36enc_to(long unsigned int value, char buf[ARG_SIZE_HINT base36bufsize])
 {
 	const char	base36[36] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-	/* log(2**64) / log(36) = 12.38 => max 13 char + '\0' */
-	static char	buffer[14];
-	unsigned int offset = sizeof(buffer);
+	char	buffer[base36bufsize];
+	char   *p;
 
-	buffer[--offset] = '\0';
+	p = &buffer[sizeof(buffer)-1];
+	*p = '\0';
 	do {
-		buffer[--offset] = base36[value % 36];
+		*(--p) = base36[value % 36];
 	} while (value /= 36);
 
-	return &buffer[offset];
-}
+	/* I know, it doesn't look safe */
+	strncpy(buf, p, base36bufsize);
 
-/*
- * Same as base36enc(), but the result must be released by the user.
- */
-char *
-base36enc_dup(long unsigned int value)
-{
-	const char	base36[36] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-	/* log(2**64) / log(36) = 12.38 => max 13 char + '\0' */
-	char		buffer[14];
-	unsigned int offset = sizeof(buffer);
-
-	buffer[--offset] = '\0';
-	do {
-		buffer[--offset] = base36[value % 36];
-	} while (value /= 36);
-
-	return strdup(&buffer[offset]);
+	return buf;
 }
 
 long unsigned int
@@ -90,7 +74,7 @@ checkControlFile(ControlFileData *ControlFile)
 
 	if ((ControlFile->pg_control_version % 65536 == 0 || ControlFile->pg_control_version % 65536 > 10000) &&
 			ControlFile->pg_control_version / 65536 != 0)
-		elog(ERROR, "possible byte ordering mismatch\n"
+		elog(ERROR, "Possible byte ordering mismatch\n"
 			 "The byte ordering used to store the pg_control file might not match the one\n"
 			 "used by this program. In that case the results below would be incorrect, and\n"
 			 "the PostgreSQL installation would be incompatible with this data directory.");
@@ -109,7 +93,7 @@ digestControlFile(ControlFileData *ControlFile, char *src, size_t size)
 #endif
 
 	if (size != ControlFileSize)
-		elog(ERROR, "unexpected control file size %d, expected %d",
+		elog(ERROR, "Unexpected control file size %d, expected %d",
 			 (int) size, ControlFileSize);
 
 	memcpy(ControlFile, src, sizeof(ControlFileData));
@@ -576,4 +560,24 @@ datapagemap_print_debug(datapagemap_t *map)
 		elog(VERBOSE, "  block %u", blocknum);
 
 	pg_free(iter);
+}
+
+const char*
+backup_id_of(pgBackup *backup)
+{
+	/* Change this Assert when backup_id will not be bound to start_time */
+	Assert(backup->backup_id == backup->start_time || backup->start_time == 0);
+
+	if (backup->backup_id_encoded[0] == '\x00')
+	{
+		base36enc_to(backup->backup_id, backup->backup_id_encoded);
+	}
+	return backup->backup_id_encoded;
+}
+
+void
+reset_backup_id(pgBackup *backup)
+{
+	backup->backup_id = INVALID_BACKUP_ID;
+	memset(backup->backup_id_encoded, 0, sizeof(backup->backup_id_encoded));
 }

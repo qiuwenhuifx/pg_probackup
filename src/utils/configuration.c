@@ -521,11 +521,17 @@ config_get_opt(int argc, char **argv, ConfigOption cmd_options[],
 
 	optstring = longopts_to_optstring(longopts, cmd_len + len);
 
+	opterr = 0;
 	/* Assign named options */
 	while ((c = getopt_long(argc, argv, optstring, longopts, &optindex)) != -1)
 	{
 		ConfigOption *opt;
 
+		if (c == '?')
+		{
+			elog(ERROR, "Option '%s' requires an argument. Try \"%s --help\" for more information.",
+				 argv[optind-1], PROGRAM_NAME);
+		}
 		opt = option_find(c, cmd_options);
 		if (opt == NULL)
 			opt = option_find(c, options);
@@ -537,6 +543,9 @@ config_get_opt(int argc, char **argv, ConfigOption cmd_options[],
 		/* Check 'opt == NULL' is performed in assign_option() */
 		assign_option(opt, optarg, SOURCE_CMD);
 	}
+
+	pgut_free(optstring);
+	pgut_free(longopts);
 
 	return optind;
 }
@@ -686,7 +695,7 @@ option_get_value(ConfigOption *opt)
 		if (opt->type == 'i')
 			convert_from_base_unit(*((int32 *) opt->var),
 								   opt->flags & OPTION_UNIT, &value, &unit);
-		else if (opt->type == 'i')
+		else if (opt->type == 'I')
 			convert_from_base_unit(*((int64 *) opt->var),
 								   opt->flags & OPTION_UNIT, &value, &unit);
 		else if (opt->type == 'u')
@@ -1174,7 +1183,8 @@ parse_time(const char *value, time_t *result, bool utc_default)
 	char 	   *local_tz = getenv("TZ");
 
 	/* tmp = replace( value, !isalnum, ' ' ) */
-	tmp = pgut_malloc(strlen(value) + + 1);
+	tmp = pgut_malloc(strlen(value) + 1);
+	if(!tmp) return false;
 	len = 0;
 	fields_num = 1;
 
@@ -1202,7 +1212,10 @@ parse_time(const char *value, time_t *result, bool utc_default)
 			errno = 0;
 			hr = strtol(value + 1, &cp, 10);
 			if ((value + 1) == cp || errno == ERANGE)
+			{
+				pfree(tmp);
 				return false;
+			}
 
 			/* explicit delimiter? */
 			if (*cp == ':')
@@ -1210,13 +1223,19 @@ parse_time(const char *value, time_t *result, bool utc_default)
 				errno = 0;
 				min = strtol(cp + 1, &cp, 10);
 				if (errno == ERANGE)
+				{
+					pfree(tmp);
 					return false;
+				}
 				if (*cp == ':')
 				{
 					errno = 0;
 					sec = strtol(cp + 1, &cp, 10);
 					if (errno == ERANGE)
+					{
+						pfree(tmp);
 						return false;
+					}
 				}
 			}
 			/* otherwise, might have run things together... */
@@ -1231,11 +1250,20 @@ parse_time(const char *value, time_t *result, bool utc_default)
 
 			/* Range-check the values; see notes in datatype/timestamp.h */
 			if (hr < 0 || hr > MAX_TZDISP_HOUR)
+			{
+				pfree(tmp);
 				return false;
+			}
 			if (min < 0 || min >= MINS_PER_HOUR)
+			{
+				pfree(tmp);
 				return false;
+			}
 			if (sec < 0 || sec >= SECS_PER_MINUTE)
+			{
+				pfree(tmp);
 				return false;
+			}
 
 			tz = (hr * MINS_PER_HOUR + min) * SECS_PER_MINUTE + sec;
 			if (*value == '-')
@@ -1248,7 +1276,10 @@ parse_time(const char *value, time_t *result, bool utc_default)
 		}
 		/* wrong format */
 		else if (!IsSpace(*value))
+		{
+			pfree(tmp);
 			return false;
+		}
 		else
 			value++;
 	}
@@ -1265,7 +1296,7 @@ parse_time(const char *value, time_t *result, bool utc_default)
 	i = sscanf(tmp, "%04d %02d %02d %02d %02d %02d%1s",
 		&tm.tm_year, &tm.tm_mon, &tm.tm_mday,
 		&tm.tm_hour, &tm.tm_min, &tm.tm_sec, junk);
-	free(tmp);
+	pfree(tmp);
 
 	if (i < 3 || i > 6)
 		return false;
@@ -1291,9 +1322,7 @@ parse_time(const char *value, time_t *result, bool utc_default)
 	{
 		/* set timezone to UTC */
 		pgut_setenv("TZ", "UTC");
-#ifdef WIN32
 		tzset();
-#endif
 	}
 
 	/* convert time to utc unix time */
@@ -1305,9 +1334,7 @@ parse_time(const char *value, time_t *result, bool utc_default)
 	else
 		pgut_unsetenv("TZ");
 
-#ifdef WIN32
 	tzset();
-#endif
 
 	/* adjust time zone */
 	if (tz_set || utc_default)
@@ -1418,16 +1445,16 @@ parse_lsn(const char *value, XLogRecPtr *result)
 
 	len1 = strspn(value, "0123456789abcdefABCDEF");
 	if (len1 < 1 || len1 > MAXPG_LSNCOMPONENT || value[len1] != '/')
-		elog(ERROR, "invalid LSN \"%s\"", value);
+		elog(ERROR, "Invalid LSN \"%s\"", value);
 	len2 = strspn(value + len1 + 1, "0123456789abcdefABCDEF");
 	if (len2 < 1 || len2 > MAXPG_LSNCOMPONENT || value[len1 + 1 + len2] != '\0')
-		elog(ERROR, "invalid LSN \"%s\"", value);
+		elog(ERROR, "Invalid LSN \"%s\"", value);
 
 	if (sscanf(value, "%X/%X", &xlogid, &xrecoff) == 2)
 		*result = (XLogRecPtr) ((uint64) xlogid << 32) | xrecoff;
 	else
 	{
-		elog(ERROR, "invalid LSN \"%s\"", value);
+		elog(ERROR, "Invalid LSN \"%s\"", value);
 		return false;
 	}
 
@@ -1543,32 +1570,18 @@ time2iso(char *buf, size_t len, time_t time, bool utc)
 	time_t		gmt;
 	time_t		offset;
 	char	   *ptr = buf;
-	char 	   *local_tz = getenv("TZ");
 
 	/* set timezone to UTC if requested */
 	if (utc)
 	{
-		pgut_setenv("TZ", "UTC");
-#ifdef WIN32
-		tzset();
-#endif
+		ptm = gmtime(&time);
+		strftime(ptr, len, "%Y-%m-%d %H:%M:%S+00", ptm);
+		return;
 	}
 
 	ptm = gmtime(&time);
 	gmt = mktime(ptm);
 	ptm = localtime(&time);
-
-	if (utc)
-	{
-		/* return old timezone back if any */
-		if (local_tz)
-			pgut_setenv("TZ", local_tz);
-		else
-			pgut_unsetenv("TZ");
-#ifdef WIN32
-		tzset();
-#endif
-	}
 
 	/* adjust timezone offset */
 	offset = time - gmt + (ptm->tm_isdst ? 3600 : 0);

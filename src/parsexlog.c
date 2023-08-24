@@ -392,7 +392,7 @@ validate_backup_wal_from_start_to_stop(pgBackup *backup,
 
 		elog(WARNING, "There are not enough WAL records to consistenly restore "
 			"backup %s from START LSN: %X/%X to STOP LSN: %X/%X",
-			 base36enc(backup->start_time),
+			 backup_id_of(backup),
 			 (uint32) (backup->start_lsn >> 32),
 			 (uint32) (backup->start_lsn),
 			 (uint32) (backup->stop_lsn >> 32),
@@ -410,24 +410,20 @@ validate_wal(pgBackup *backup, const char *archivedir,
 			 time_t target_time, TransactionId target_xid,
 			 XLogRecPtr target_lsn, TimeLineID tli, uint32 wal_seg_size)
 {
-	const char *backup_id;
 	XLogRecTarget last_rec;
 	char		last_timestamp[100],
 				target_timestamp[100];
 	bool		all_wal = false;
 
-	/* We need free() this later */
-	backup_id = base36enc(backup->start_time);
-
 	if (!XRecOffIsValid(backup->start_lsn))
 		elog(ERROR, "Invalid start_lsn value %X/%X of backup %s",
 			 (uint32) (backup->start_lsn >> 32), (uint32) (backup->start_lsn),
-			 backup_id);
+			 backup_id_of(backup));
 
 	if (!XRecOffIsValid(backup->stop_lsn))
 		elog(ERROR, "Invalid stop_lsn value %X/%X of backup %s",
 			 (uint32) (backup->stop_lsn >> 32), (uint32) (backup->stop_lsn),
-			 backup_id);
+			 backup_id_of(backup));
 
 	/*
 	 * Check that the backup has all wal files needed
@@ -450,7 +446,7 @@ validate_wal(pgBackup *backup, const char *archivedir,
 
 	if (backup->status == BACKUP_STATUS_CORRUPT)
 	{
-		elog(WARNING, "Backup %s WAL segments are corrupted", backup_id);
+		elog(WARNING, "Backup %s WAL segments are corrupted", backup_id_of(backup));
 		return;
 	}
 	/*
@@ -461,7 +457,7 @@ validate_wal(pgBackup *backup, const char *archivedir,
 		!XRecOffIsValid(target_lsn))
 	{
 		/* Recovery target is not given so exit */
-		elog(INFO, "Backup %s WAL segments are valid", backup_id);
+		elog(INFO, "Backup %s WAL segments are valid", backup_id_of(backup));
 		return;
 	}
 
@@ -1443,7 +1439,18 @@ XLogThreadWorker(void *arg)
 			 * Usually SimpleXLogPageRead() does it by itself. But here we need
 			 * to do it manually to support threads.
 			 */
+#if PG_VERSION_NUM >= 150000
+			if (reader_data->need_switch && (
+					errormsg == NULL ||
+					/*
+					 * Pg15 now informs if "contrecord" is missing.
+					 * TODO: probably we should abort reading logs at this moment.
+					 * But we continue as we did with bug present in Pg < 15.
+					 */
+					!XLogRecPtrIsInvalid(xlogreader->abortedRecPtr)))
+#else
 			if (reader_data->need_switch && errormsg == NULL)
+#endif
 			{
 				if (SwitchThreadToNextWal(xlogreader, thread_arg))
 					continue;

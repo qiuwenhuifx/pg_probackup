@@ -993,6 +993,12 @@ pgut_str_strip_trailing_filename(const char *filepath, const char *filename)
 		return pgut_strndup(filepath, fp_len);
 }
 
+void
+pgut_free(void *p)
+{
+	free(p);
+}
+
 FILE *
 pgut_fopen(const char *path, const char *mode, bool missing_ok)
 {
@@ -1209,13 +1215,16 @@ pgut_pgfnames(const char *path, bool strict)
 		}
 	}
 
+	filenames[numnames] = NULL;
+
 	if (errno)
 	{
 		elog(strict ? ERROR : WARNING, "could not read directory \"%s\": %m", path);
+		pgut_pgfnames_cleanup(filenames);		
+		closedir(dir);
 		return NULL;
 	}
 
-	filenames[numnames] = NULL;
 
 	if (closedir(dir))
 	{

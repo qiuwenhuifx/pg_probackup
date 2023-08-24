@@ -153,7 +153,7 @@ write_backup_status(pgBackup *backup, BackupStatus status,
 
 	/* lock backup in exclusive mode */
 	if (!lock_backup(tmp, strict, true))
-		elog(ERROR, "Cannot lock backup %s directory", base36enc(backup->start_time));
+		elog(ERROR, "Cannot lock backup %s directory", backup_id_of(backup));
 
 	write_backup(tmp, strict);
 
@@ -193,7 +193,7 @@ lock_backup(pgBackup *backup, bool strict, bool exclusive)
 
 	join_path_components(lock_file, backup->root_dir, BACKUP_LOCK_FILE);
 
-	rc = grab_excl_lock_file(backup->root_dir, base36enc(backup->start_time), strict);
+	rc = grab_excl_lock_file(backup->root_dir, backup_id_of(backup), strict);
 
 	if (rc == LOCK_FAIL_TIMEOUT)
 		return false;
@@ -258,7 +258,7 @@ lock_backup(pgBackup *backup, bool strict, bool exclusive)
 		 * freed some space on filesystem, thanks to unlinking of BACKUP_RO_LOCK_FILE.
 		 * If somebody concurrently acquired exclusive lock file first, then we should give up.
 		 */
-		if (grab_excl_lock_file(backup->root_dir, base36enc(backup->start_time), strict) == LOCK_FAIL_TIMEOUT)
+		if (grab_excl_lock_file(backup->root_dir, backup_id_of(backup), strict) == LOCK_FAIL_TIMEOUT)
 			return false;
 
 		return true;
@@ -275,7 +275,7 @@ lock_backup(pgBackup *backup, bool strict, bool exclusive)
 
 	/* save lock metadata for later unlocking */
 	lock = pgut_malloc(sizeof(LockInfo));
-	snprintf(lock->backup_id, 10, "%s", base36enc(backup->backup_id));
+	snprintf(lock->backup_id, 10, "%s", backup_id_of(backup));
 	snprintf(lock->backup_dir, MAXPGPATH, "%s", backup->root_dir);
 	lock->exclusive = exclusive;
 
@@ -521,7 +521,7 @@ grab_lock:
 	}
 
 //	elog(LOG, "Acquired exclusive lock for backup %s after %ds",
-//			base36enc(backup->start_time),
+//			backup_id_of(backup),
 //			LOCK_TIMEOUT - ntries + LOCK_STALE_TIMEOUT - empty_tries);
 
 	return LOCK_OK;
@@ -561,7 +561,7 @@ wait_shared_owners(pgBackup *backup)
         {
             if (interrupted)
                 elog(ERROR, "Interrupted while locking backup %s",
-                    base36enc(backup->start_time));
+                    backup_id_of(backup));
 
             if (encoded_pid == my_pid)
                 break;
@@ -573,10 +573,10 @@ wait_shared_owners(pgBackup *backup)
                 if ((ntries % LOG_FREQ) == 0)
                 {
                     elog(WARNING, "Process %d is using backup %s in shared mode, and is still running",
-                            encoded_pid, base36enc(backup->start_time));
+                            encoded_pid, backup_id_of(backup));
 
                     elog(WARNING, "Waiting %u seconds on lock for backup %s", ntries,
-                            base36enc(backup->start_time));
+                            backup_id_of(backup));
                 }
 
                 sleep(1);
@@ -604,7 +604,7 @@ wait_shared_owners(pgBackup *backup)
     if (ntries <= 0)
     {
         elog(WARNING, "Cannot to lock backup %s in exclusive mode, because process %u owns shared lock",
-                base36enc(backup->start_time), encoded_pid);
+                backup_id_of(backup), encoded_pid);
         return 1;
     }
 
@@ -891,7 +891,7 @@ catalog_get_instance_list(CatalogState *catalogState)
 
 		instanceState = pgut_new(InstanceState);
 
-		strncpy(instanceState->instance_name, dent->d_name, MAXPGPATH);
+		strlcpy(instanceState->instance_name, dent->d_name, MAXPGPATH);
 		join_path_components(instanceState->instance_backup_subdir_path,
 							catalogState->backup_subdir_path, instanceState->instance_name);
 		join_path_components(instanceState->instance_wal_subdir_path,
@@ -963,15 +963,18 @@ catalog_get_backup_list(InstanceState *instanceState, time_t requested_backup_id
 
 		if (!backup)
 		{
-			backup = pgut_new(pgBackup);
+			backup = pgut_new0(pgBackup);
 			pgBackupInit(backup);
 			backup->start_time = base36dec(data_ent->d_name);
+			/* XXX BACKUP_ID change it when backup_id wouldn't match start_time */
+			Assert(backup->backup_id == 0 || backup->backup_id == backup->start_time);
+			backup->backup_id = backup->start_time;
 		}
-		else if (strcmp(base36enc(backup->start_time), data_ent->d_name) != 0)
+		else if (strcmp(backup_id_of(backup), data_ent->d_name) != 0)
 		{
 			/* TODO there is no such guarantees */
 			elog(WARNING, "backup ID in control file \"%s\" doesn't match name of the backup folder \"%s\"",
-				 base36enc(backup->start_time), backup_conf_path);
+				 backup_id_of(backup), backup_conf_path);
 		}
 
 		backup->root_dir = pgut_strdup(data_path);
@@ -983,7 +986,6 @@ catalog_get_backup_list(InstanceState *instanceState, time_t requested_backup_id
 		init_header_map(backup);
 
 		/* TODO: save encoded backup id */
-		backup->backup_id = backup->start_time;
 		if (requested_backup_id != INVALID_BACKUP_ID
 			&& requested_backup_id != backup->start_time)
 		{
@@ -1010,7 +1012,7 @@ catalog_get_backup_list(InstanceState *instanceState, time_t requested_backup_id
 	{
 		pgBackup   *curr = parray_get(backups, i);
 		pgBackup  **ancestor;
-		pgBackup	key;
+		pgBackup	key = {0};
 
 		if (curr->backup_mode == BACKUP_MODE_FULL)
 			continue;
@@ -1053,7 +1055,7 @@ get_backup_filelist(pgBackup *backup, bool strict)
 
 	fp = fio_open_stream(backup_filelist_path, FIO_BACKUP_HOST);
 	if (fp == NULL)
-		elog(ERROR, "cannot open \"%s\": %s", backup_filelist_path, strerror(errno));
+		elog(ERROR, "Cannot open \"%s\": %s", backup_filelist_path, strerror(errno));
 
 	/* enable stdio buffering for local file */
 	if (!fio_is_remote(FIO_BACKUP_HOST))
@@ -1140,7 +1142,10 @@ get_backup_filelist(pgBackup *backup, bool strict)
 		if (!file->is_datafile || file->is_cfs)
 			file->size = file->uncompressed_size;
 
-		if (file->external_dir_num == 0 && S_ISREG(file->mode))
+		if (file->external_dir_num == 0 &&
+				(file->dbOid != 0 ||
+				 path_is_prefix_of_path("global", file->rel_path)) &&
+				S_ISREG(file->mode))
 		{
 			bool is_datafile = file->is_datafile;
 			set_forkname(file);
@@ -1180,7 +1185,7 @@ get_backup_filelist(pgBackup *backup, bool strict)
 
 	/* redundant sanity? */
 	if (!files)
-		elog(strict ? ERROR : WARNING, "Failed to get file list for backup %s", base36enc(backup->start_time));
+		elog(strict ? ERROR : WARNING, "Failed to get file list for backup %s", backup_id_of(backup));
 
 	return files;
 }
@@ -1206,7 +1211,7 @@ catalog_lock_backup_list(parray *backup_list, int from_idx, int to_idx, bool str
 		pgBackup   *backup = (pgBackup *) parray_get(backup_list, i);
 		if (!lock_backup(backup, strict, exclusive))
 			elog(ERROR, "Cannot lock backup %s directory",
-				 base36enc(backup->start_time));
+				 backup_id_of(backup));
 	}
 }
 
@@ -1219,7 +1224,6 @@ catalog_get_last_data_backup(parray *backup_list, TimeLineID tli, time_t current
 	int			i;
 	pgBackup   *full_backup = NULL;
 	pgBackup   *tmp_backup = NULL;
-	char 	   *invalid_backup_id;
 
 	/* backup_list is sorted in order of descending ID */
 	for (i = 0; i < parray_num(backup_list); i++)
@@ -1240,7 +1244,7 @@ catalog_get_last_data_backup(parray *backup_list, TimeLineID tli, time_t current
 		return NULL;
 
 	elog(LOG, "Latest valid FULL backup: %s",
-		base36enc(full_backup->start_time));
+		backup_id_of(full_backup));
 
 	/* FULL backup is found, lets find his latest child */
 	for (i = 0; i < parray_num(backup_list); i++)
@@ -1255,20 +1259,14 @@ catalog_get_last_data_backup(parray *backup_list, TimeLineID tli, time_t current
 			{
 				/* broken chain */
 				case ChainIsBroken:
-					invalid_backup_id = base36enc_dup(tmp_backup->parent_backup);
-
 					elog(WARNING, "Backup %s has missing parent: %s. Cannot be a parent",
-						base36enc(backup->start_time), invalid_backup_id);
-					pg_free(invalid_backup_id);
+						backup_id_of(backup), base36enc(tmp_backup->parent_backup));
 					continue;
 
 				/* chain is intact, but at least one parent is invalid */
 				case ChainIsInvalid:
-					invalid_backup_id = base36enc_dup(tmp_backup->start_time);
-
 					elog(WARNING, "Backup %s has invalid parent: %s. Cannot be a parent",
-						base36enc(backup->start_time), invalid_backup_id);
-					pg_free(invalid_backup_id);
+						backup_id_of(backup), backup_id_of(tmp_backup));
 					continue;
 
 				/* chain is ok */
@@ -1287,7 +1285,7 @@ catalog_get_last_data_backup(parray *backup_list, TimeLineID tli, time_t current
 		else
 		{
 			elog(WARNING, "Backup %s has status: %s. Cannot be a parent.",
-				base36enc(backup->start_time), status2str(backup->status));
+				backup_id_of(backup), status2str(backup->status));
 		}
 	}
 
@@ -1373,7 +1371,7 @@ get_multi_timeline_parent(parray *backup_list, parray *tli_list,
 		return NULL;
 	else
 		elog(LOG, "Latest valid full backup: %s, tli: %i",
-			base36enc(ancestor_backup->start_time), ancestor_backup->tli);
+			backup_id_of(ancestor_backup), ancestor_backup->tli);
 
 	/* At this point we found suitable full backup,
 	 * now we must find his latest child, suitable to be
@@ -1461,7 +1459,7 @@ pgBackupInitDir(pgBackup *backup, const char *backup_instance_path)
 	if (create_backup_dir(backup, backup_instance_path) != 0)
 	{
 		/* Clear backup_id as indication of error */
-		backup->backup_id = INVALID_BACKUP_ID;
+		reset_backup_id(backup);
 		return;
 	}
 
@@ -1513,7 +1511,7 @@ create_backup_dir(pgBackup *backup, const char *backup_instance_path)
 	int    rc;
 	char   path[MAXPGPATH];
 
-	join_path_components(path, backup_instance_path, base36enc(backup->backup_id));
+	join_path_components(path, backup_instance_path, backup_id_of(backup));
 
 	/* TODO: add wrapper for remote mode */
 	rc = dir_create_dir(path, DIR_PERMISSION, true);
@@ -1628,7 +1626,8 @@ catalog_get_timelines(InstanceState *instanceState, InstanceConfig *instance)
 				}
 				/* temp WAL segment */
 				else if (IsTempXLogFileName(file->name) ||
-						 IsTempCompressXLogFileName(file->name))
+						 IsTempCompressXLogFileName(file->name) ||
+						 IsTempPartialXLogFileName(file->name))
 				{
 					elog(VERBOSE, "temp WAL file \"%s\"", file->name);
 
@@ -1878,7 +1877,7 @@ catalog_get_timelines(InstanceState *instanceState, InstanceConfig *instance)
 				{
 					elog(LOG, "Pinned backup %s is ignored for the "
 							"purpose of WAL retention",
-						base36enc(backup->start_time));
+						backup_id_of(backup));
 					continue;
 				}
 
@@ -2064,7 +2063,7 @@ catalog_get_timelines(InstanceState *instanceState, InstanceConfig *instance)
 			elog(LOG, "Archive backup %s to stay consistent "
 							"protect from purge WAL interval "
 							"between %s and %s on timeline %i",
-						base36enc(backup->start_time),
+						backup_id_of(backup),
 						begin_segno_str, end_segno_str, backup->tli);
 
 			if (tlinfo->keep_segments == NULL)
@@ -2246,6 +2245,12 @@ do_set_backup(InstanceState *instanceState, time_t backup_id,
 
 	if (set_backup_params->note)
 		add_note(target_backup, set_backup_params->note);
+	/* Cleanup */
+	if (backup_list)
+	{
+		parray_walk(backup_list, pgBackupFree);
+		parray_free(backup_list);
+	}
 }
 
 /*
@@ -2259,7 +2264,7 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 	/* sanity, backup must have positive recovery-time */
 	if (target_backup->recovery_time <= 0)
 		elog(ERROR, "Failed to set 'expire-time' for backup %s: invalid 'recovery-time'",
-						base36enc(target_backup->backup_id));
+						backup_id_of(target_backup));
 
 	/* Pin comes from ttl */
 	if (set_backup_params->ttl > 0)
@@ -2273,7 +2278,7 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 		if (target_backup->expire_time == 0)
 		{
 			elog(WARNING, "Backup %s is not pinned, nothing to unpin",
-									base36enc(target_backup->start_time));
+									backup_id_of(target_backup));
 			return;
 		}
 		target_backup->expire_time = 0;
@@ -2293,11 +2298,11 @@ pin_backup(pgBackup	*target_backup, pgSetBackupParams *set_backup_params)
 		char	expire_timestamp[100];
 
 		time2iso(expire_timestamp, lengthof(expire_timestamp), target_backup->expire_time, false);
-		elog(INFO, "Backup %s is pinned until '%s'", base36enc(target_backup->start_time),
+		elog(INFO, "Backup %s is pinned until '%s'", backup_id_of(target_backup),
 														expire_timestamp);
 	}
 	else
-		elog(INFO, "Backup %s is unpinned", base36enc(target_backup->start_time));
+		elog(INFO, "Backup %s is unpinned", backup_id_of(target_backup));
 
 	return;
 }
@@ -2311,13 +2316,14 @@ add_note(pgBackup *target_backup, char *note)
 {
 
 	char *note_string;
+	char *p;
 
 	/* unset note */
 	if (pg_strcasecmp(note, "none") == 0)
 	{
 		target_backup->note = NULL;
 		elog(INFO, "Removing note from backup %s",
-				base36enc(target_backup->start_time));
+				backup_id_of(target_backup));
 	}
 	else
 	{
@@ -2327,12 +2333,12 @@ add_note(pgBackup *target_backup, char *note)
 		 * we save only "aaa"
 		 * Example: tests.set_backup.SetBackupTest.test_add_note_newlines
 		 */
-		note_string = pgut_malloc(MAX_NOTE_SIZE);
-		sscanf(note, "%[^\n]", note_string);
+		p = strchr(note, '\n');
+		note_string = pgut_strndup(note, p ? (p-note) : MAX_NOTE_SIZE);
 
 		target_backup->note = note_string;
 		elog(INFO, "Adding note to backup %s: '%s'",
-				base36enc(target_backup->start_time), target_backup->note);
+				backup_id_of(target_backup), target_backup->note);
 	}
 
 	/* Update backup.control */
@@ -2651,7 +2657,7 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
 static pgBackup *
 readBackupControlFile(const char *path)
 {
-	pgBackup   *backup = pgut_new(pgBackup);
+	pgBackup   *backup = pgut_new0(pgBackup);
 	char	   *backup_mode = NULL;
 	char	   *start_lsn = NULL;
 	char	   *stop_lsn = NULL;
@@ -2721,6 +2727,9 @@ readBackupControlFile(const char *path)
 		pgBackupFree(backup);
 		return NULL;
 	}
+	/* XXX BACKUP_ID change it when backup_id wouldn't match start_time */
+	Assert(backup->backup_id == 0 || backup->backup_id == backup->start_time);
+	backup->backup_id = backup->start_time;
 
 	if (backup_mode)
 	{
@@ -2832,7 +2841,7 @@ parse_backup_mode(const char *value)
 		return BACKUP_MODE_DIFF_DELTA;
 
 	/* Backup mode is invalid, so leave with an error */
-	elog(ERROR, "invalid backup-mode \"%s\"", value);
+	elog(ERROR, "Invalid backup-mode \"%s\"", value);
 	return BACKUP_MODE_INVALID;
 }
 
@@ -2867,7 +2876,7 @@ parse_compress_alg(const char *arg)
 	len = strlen(arg);
 
 	if (len == 0)
-		elog(ERROR, "compress algorithm is empty");
+		elog(ERROR, "Compress algorithm is empty");
 
 	if (pg_strncasecmp("zlib", arg, len) == 0)
 		return ZLIB_COMPRESS;
@@ -2876,7 +2885,7 @@ parse_compress_alg(const char *arg)
 	else if (pg_strncasecmp("none", arg, len) == 0)
 		return NONE_COMPRESS;
 	else
-		elog(ERROR, "invalid compress algorithm value \"%s\"", arg);
+		elog(ERROR, "Invalid compress algorithm value \"%s\"", arg);
 
 	return NOT_DEFINED_COMPRESS;
 }
@@ -3054,7 +3063,7 @@ find_parent_full_backup(pgBackup *current_backup)
 				 base36enc(base_full_backup->parent_backup));
 		else
 			elog(WARNING, "Failed to find parent FULL backup for %s",
-				 base36enc(current_backup->start_time));
+				 backup_id_of(current_backup));
 		return NULL;
 	}
 

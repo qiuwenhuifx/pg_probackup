@@ -135,6 +135,9 @@ extern const char  *PROGRAM_EMAIL;
 #define XRecOffIsNull(xlrp) \
 		((xlrp) % XLOG_BLCKSZ == 0)
 
+/* log(2**64) / log(36) = 12.38 => max 13 char + '\0' */
+#define base36bufsize 14
+
 /* Text Coloring macro */
 #define TC_LEN 11
 #define TC_RED "\033[0;31m"
@@ -150,7 +153,6 @@ extern const char  *PROGRAM_EMAIL;
 #define TC_CYAN "\033[0;36m"
 #define TC_CYAN_BOLD "\033[1;36m"
 #define TC_RESET "\033[0m"
-
 
 typedef struct RedoParams
 {
@@ -220,7 +222,9 @@ typedef enum ForkName
 	fsm,
 	cfm,
 	init,
-	ptrack
+	ptrack,
+	cfs_bck,
+	cfm_bck
 } ForkName;
 
 #define INIT_FILE_CRC32(use_crc32c, crc) \
@@ -276,6 +280,7 @@ typedef struct pgFile
 	int		segno;			/* Segment number for ptrack */
 	int		n_blocks;		/* number of blocks in the data file in data directory */
 	bool	is_cfs;			/* Flag to distinguish files compressed by CFS*/
+	struct pgFile  *cfs_chain;	/* linked list of CFS segment's cfm, bck, cfm_bck related files */
 	int		external_dir_num;	/* Number of external directory. 0 if not external */
 	bool	exists_in_prev;		/* Mark files, both data and regular, that exists in previous backup */
 	CompressAlg		compress_alg;		/* compression algorithm applied to the file */
@@ -290,6 +295,8 @@ typedef struct pgFile
 	pg_off_t hdr_off;       /* offset in header map */
 	int      hdr_size;      /* length of headers */
 	bool	excluded;	/* excluded via --exclude-path option */
+	bool	skip_cfs_nested; 	/* mark to skip in processing treads as nested to cfs_chain */
+	bool	remove_from_list;	/* tmp flag to clean up files list from temp and unlogged tables */
 } pgFile;
 
 typedef struct page_map_entry
@@ -345,7 +352,7 @@ typedef enum ShowFormat
 #define BYTES_INVALID		(-1) /* file didn`t changed since previous backup, DELTA backup do not rely on it */
 #define FILE_NOT_FOUND		(-2) /* file disappeared during backup */
 #define BLOCKNUM_INVALID	(-1)
-#define PROGRAM_VERSION	"2.5.10"
+#define PROGRAM_VERSION	"2.5.12"
 
 /* update when remote agent API or behaviour changes */
 #define AGENT_PROTOCOL_VERSION 20509
@@ -532,6 +539,8 @@ struct pgBackup
 
 	/* map used for access to page headers */
 	HeaderMap       hdr_map;
+
+	char 			backup_id_encoded[base36bufsize];
 };
 
 /* Recovery target for restore and validate subcommands */
@@ -773,6 +782,11 @@ typedef struct StopBackupCallbackParams
 	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN &&		\
 	 strcmp((fname) + XLOG_FNAME_LEN, ".part") == 0)
 
+#define IsTempPartialXLogFileName(fname)	\
+	(strlen(fname) == XLOG_FNAME_LEN + strlen(".partial.part") &&	\
+	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN &&		\
+	 strcmp((fname) + XLOG_FNAME_LEN, ".partial.part") == 0)
+
 #define IsTempCompressXLogFileName(fname)	\
 	(strlen(fname) == XLOG_FNAME_LEN + strlen(".gz.part") && \
 	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN &&		\
@@ -881,6 +895,9 @@ extern pgRecoveryTarget *parseRecoveryTargetOptions(
 
 extern parray *get_dbOid_exclude_list(pgBackup *backup, parray *datname_list,
 										PartialRestoreType partial_restore_type);
+
+extern const char* backup_id_of(pgBackup *backup);
+extern void reset_backup_id(pgBackup *backup);
 
 extern parray *get_backup_filelist(pgBackup *backup, bool strict);
 extern parray *read_timeline_history(const char *arclog_path, TimeLineID targetTLI, bool strict);
@@ -1192,8 +1209,9 @@ extern void time2iso(char *buf, size_t len, time_t time, bool utc);
 extern const char *status2str(BackupStatus status);
 const char *status2str_color(BackupStatus status);
 extern BackupStatus str2status(const char *status);
-extern const char *base36enc(long unsigned int value);
-extern char *base36enc_dup(long unsigned int value);
+extern const char *base36enc_to(long unsigned int value, char buf[ARG_SIZE_HINT base36bufsize]);
+/* Abuse C99 Compound Literal's lifetime */
+#define base36enc(value) (base36enc_to((value), (char[base36bufsize]){0}))
 extern long unsigned int base36dec(const char *text);
 extern uint32 parse_server_version(const char *server_version_str);
 extern uint32 parse_program_version(const char *program_version);
