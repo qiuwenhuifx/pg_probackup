@@ -155,7 +155,7 @@ dir_create_dir(const char *dir, mode_t mode, bool strict)
 	get_parent_directory(parent);
 
 	/* Create parent first */
-	if (access(parent, F_OK) == -1)
+	if (strlen(parent) > 0 && access(parent, F_OK) == -1)
 		dir_create_dir(parent, mode, false);
 
 	/* Create directory */
@@ -1175,7 +1175,6 @@ check_tablespace_mapping(pgBackup *backup, bool incremental, bool force, bool pg
 	{
 		pgFile	   *link = (pgFile *) parray_get(links, i);
 		const char *linked_path = link->linked;
-		TablespaceListCell *cell;
 		bool remapped = false;
 
 		for (cell = tablespace_dirs.head; cell; cell = cell->next)

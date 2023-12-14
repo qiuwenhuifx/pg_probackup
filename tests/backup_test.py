@@ -3075,11 +3075,20 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         except ProbackupException as e:
             # 9.5: ERROR:  must be superuser or replication role to run a backup
             # >=9.6: FATAL:  must be superuser or replication role to start walsender
-            self.assertRegex(
-                e.message,
-                "ERROR:  must be superuser or replication role to run a backup|FATAL:  must be superuser or replication role to start walsender",
-                "\n Unexpected Error Message: {0}\n CMD: {1}".format(
-                    repr(e.message), self.cmd))
+            if self.pg_config_version < 160000:
+                self.assertRegex(
+                    e.message,
+                    "ERROR:  must be superuser or replication role to run a backup|"
+                    "FATAL:  must be superuser or replication role to start walsender",
+                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
+                        repr(e.message), self.cmd))
+            else:
+                self.assertRegex(
+                    e.message,
+                    "FATAL:  permission denied to start WAL sender\n"
+                    "DETAIL:  Only roles with the REPLICATION",
+                    "\n Unexpected Error Message: {0}\n CMD: {1}".format(
+                        repr(e.message), self.cmd))
 
     # @unittest.skip("skip")
     def test_missing_replication_permission_1(self):
@@ -3228,9 +3237,17 @@ class BackupTest(ProbackupTest, unittest.TestCase):
         # 'WARNING: could not connect to database backupdb: connection to server at "localhost" (127.0.0.1), port 29732 failed: FATAL:  must be superuser or replication role to start walsender'
         # OS-dependant messages:
         # 'WARNING: could not connect to database backupdb: connection to server at "localhost" (::1), port 12101 failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?\nconnection to server at "localhost" (127.0.0.1), port 12101 failed: FATAL:  must be superuser or replication role to start walsender'
-        self.assertRegex(
-            output,
-            r'WARNING: could not connect to database backupdb:[\s\S]*?FATAL:  must be superuser or replication role to start walsender')
+
+        if self.pg_config_version < 160000:
+            self.assertRegex(
+                output,
+                r'WARNING: could not connect to database backupdb:[\s\S]*?'
+                r'FATAL:  must be superuser or replication role to start walsender')
+        else:
+            self.assertRegex(
+                output,
+                r'WARNING: could not connect to database backupdb:[\s\S]*?'
+                r'FATAL:  permission denied to start WAL sender')
 
     # @unittest.skip("skip")
     def test_basic_backup_default_transaction_read_only(self):
@@ -3606,3 +3623,36 @@ class BackupTest(ProbackupTest, unittest.TestCase):
 
         output = self.restore_node(backup_dir, 'node', node)
         self.assertNotRegex(output, r'WARNING: [^\n]* was stored as .* but looks like')
+
+    def test_2_delta_backups(self):
+        """https://github.com/postgrespro/pg_probackup/issues/596"""
+        node = self.make_simple_node('node',
+            initdb_params=['--data-checksums'])
+
+        backup_dir = os.path.join(self.tmp_path, self.module_name, self.fname, 'backup')
+
+        self.init_pb(backup_dir)
+        self.add_instance(backup_dir, 'node', node)
+        # self.set_archiving(backup_dir, 'node', node)
+        node.slow_start()
+
+        # FULL
+        full_backup_id = self.backup_node(backup_dir, 'node', node, options=["--stream"])
+
+        # delta backup mode
+        delta_backup_id1 = self.backup_node(
+            backup_dir, 'node', node, backup_type="delta", options=["--stream"])
+
+        delta_backup_id2 = self.backup_node(
+            backup_dir, 'node', node, backup_type="delta", options=["--stream"])
+
+        # postgresql.conf and pg_hba.conf shouldn't be copied
+        conf_file = os.path.join(backup_dir, 'backups', 'node', delta_backup_id1, 'database', 'postgresql.conf')
+        self.assertFalse(
+            os.path.exists(conf_file),
+            "File should not exist: {0}".format(conf_file))
+        conf_file = os.path.join(backup_dir, 'backups', 'node', delta_backup_id2, 'database', 'postgresql.conf')
+        print(conf_file)
+        self.assertFalse(
+            os.path.exists(conf_file),
+            "File should not exist: {0}".format(conf_file))

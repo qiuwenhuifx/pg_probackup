@@ -110,6 +110,8 @@ extern const char  *PROGRAM_EMAIL;
 /* 64-bit xid support for PGPRO_EE */
 #ifndef PGPRO_EE
 #define XID_FMT "%u"
+#elif !defined(XID_FMT)
+#define XID_FMT UINT64_FORMAT
 #endif
 
 #ifndef STDIN_FILENO
@@ -179,6 +181,7 @@ typedef enum DestDirIncrCompatibility
 	POSTMASTER_IS_RUNNING,
 	SYSTEM_ID_MISMATCH,
 	BACKUP_LABEL_EXISTS,
+	PARTIAL_INCREMENTAL_FORBIDDEN,
 	DEST_IS_NOT_OK,
 	DEST_OK
 } DestDirIncrCompatibility;
@@ -352,7 +355,7 @@ typedef enum ShowFormat
 #define BYTES_INVALID		(-1) /* file didn`t changed since previous backup, DELTA backup do not rely on it */
 #define FILE_NOT_FOUND		(-2) /* file disappeared during backup */
 #define BLOCKNUM_INVALID	(-1)
-#define PROGRAM_VERSION	"2.5.12"
+#define PROGRAM_VERSION	"2.5.13"
 
 /* update when remote agent API or behaviour changes */
 #define AGENT_PROTOCOL_VERSION 20509
@@ -585,7 +588,8 @@ typedef struct pgRestoreParams
 	/* options for partial restore */
 	PartialRestoreType partial_restore_type;
 	parray *partial_db_list;
-	
+	bool allow_partial_incremental;
+
 	char* waldir;
 } pgRestoreParams;
 
@@ -903,7 +907,9 @@ extern parray *get_backup_filelist(pgBackup *backup, bool strict);
 extern parray *read_timeline_history(const char *arclog_path, TimeLineID targetTLI, bool strict);
 extern bool tliIsPartOfHistory(const parray *timelines, TimeLineID tli);
 extern DestDirIncrCompatibility check_incremental_compatibility(const char *pgdata, uint64 system_identifier,
-																IncrRestoreMode incremental_mode);
+																IncrRestoreMode incremental_mode,
+																parray *partial_db_list,
+																bool allow_partial_incremental);
 
 /* in remote.c */
 extern void check_remote_agent_compatibility(int agent_version,
